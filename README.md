@@ -747,6 +747,10 @@ if (now - last_heap_log > 60000) {  // Every 60 seconds
 - [lwIP](https://savannah.nongnu.org/projects/lwip/) for the TCP/IP stack
 - [wireguard-lwip](https://github.com/smartalock/wireguard-lwip) for WireGuard-lwIP integration
 
+### Developed By
+
+**[Malone Technologies LLC](https://github.com/Malone-Technologies)**
+
 ### Contributors
 
 MicroLink includes improvements from community forks:
