@@ -37,6 +37,7 @@ static const char *TAG = "ml_net_sw";
 #define WIFI_CONNECTED_BIT  BIT0
 #define WIFI_FAIL_BIT       BIT1
 #define NET_SW_STACK_SIZE   6144
+#define WIFI_DISCONNECT_DEBOUNCE_MS  5000  /* Wait 5s before declaring WiFi dead */
 
 typedef struct {
     /* Config (copied) */
@@ -79,6 +80,10 @@ typedef struct {
     /* Failback */
     TimerHandle_t failback_timer;
 
+    /* WiFi disconnect debounce */
+    TimerHandle_t wifi_debounce_timer;
+    bool wifi_disconnect_pending;
+
     /* Task */
     TaskHandle_t task_handle;
 } ml_net_switch_ctx_t;
@@ -88,6 +93,24 @@ static ml_net_switch_ctx_t s_ctx = {0};
 /* ============================================================================
  * WiFi Management
  * ========================================================================== */
+
+/* Called 5s after WiFi disconnect if it hasn't reconnected */
+static void wifi_debounce_cb(TimerHandle_t timer)
+{
+    if (!s_ctx.wifi_disconnect_pending) return;
+    s_ctx.wifi_disconnect_pending = false;
+
+    /* Only trigger switch if we're on WiFi with VPN up */
+    if (s_ctx.active_transport != ML_NET_WIFI) return;
+    if (s_ctx.state != ML_NET_SW_WIFI_VPN_UP) return;
+
+    ESP_LOGW(TAG, "WiFi down for %dms — triggering switch to cellular",
+             WIFI_DISCONNECT_DEBOUNCE_MS);
+    s_ctx.state = ML_NET_SW_SWITCHING_TO_CELL;
+    if (s_ctx.task_handle) {
+        xTaskNotifyGive(s_ctx.task_handle);
+    }
+}
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                 int32_t event_id, void *event_data)
@@ -100,6 +123,14 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                 s_ctx.wifi_retry_count++;
                 ESP_LOGI(TAG, "WiFi disconnected, retry %d/5", s_ctx.wifi_retry_count);
                 esp_wifi_connect();
+
+                /* Start debounce timer on first disconnect while VPN is up */
+                if (s_ctx.wifi_retry_count == 1 &&
+                    s_ctx.state == ML_NET_SW_WIFI_VPN_UP &&
+                    s_ctx.wifi_debounce_timer) {
+                    s_ctx.wifi_disconnect_pending = true;
+                    xTimerReset(s_ctx.wifi_debounce_timer, 0);
+                }
             } else {
                 xEventGroupSetBits(s_ctx.wifi_events, WIFI_FAIL_BIT);
             }
@@ -108,6 +139,16 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "WiFi connected, IP: " IPSTR, IP2STR(&event->ip_info.ip));
         s_ctx.wifi_retry_count = 0;
+
+        /* Cancel debounce — WiFi recovered */
+        if (s_ctx.wifi_disconnect_pending) {
+            s_ctx.wifi_disconnect_pending = false;
+            if (s_ctx.wifi_debounce_timer) {
+                xTimerStop(s_ctx.wifi_debounce_timer, 0);
+            }
+            ESP_LOGI(TAG, "WiFi recovered within debounce window");
+        }
+
         xEventGroupSetBits(s_ctx.wifi_events, WIFI_CONNECTED_BIT);
     }
 }
@@ -465,7 +506,8 @@ state_loop:
                 /* Temporarily try WiFi — if it fails, stay on cellular */
                 esp_err_t wifi_err = wifi_start();
                 if (wifi_err == ESP_OK) {
-                    /* WiFi is back! Tear down cellular and switch */
+                    /* WiFi is back! Stop cellular VPN, try WiFi VPN.
+                     * Keep cellular modem warm in case WiFi VPN fails. */
                     ESP_LOGI(TAG, "WiFi recovered! Switching back from cellular");
 
                     if (s_ctx.on_switching) {
@@ -473,21 +515,46 @@ state_loop:
                     }
 
                     vpn_stop();
-                    cellular_stop();
+                    /* Don't call cellular_stop() yet — keep modem warm */
 
                     s_ctx.active_transport = ML_NET_WIFI;
                     esp_err_t vpn_err = vpn_start();
                     if (vpn_err == ESP_OK) {
+                        /* WiFi VPN is up — now safe to tear down cellular */
+                        cellular_stop();
                         s_ctx.state = ML_NET_SW_WIFI_VPN_UP;
                         if (s_ctx.on_connected) {
                             s_ctx.on_connected(ML_NET_WIFI, s_ctx.user_data);
                         }
                         xTimerStart(s_ctx.health_timer, 0);
                     } else {
-                        /* WiFi VPN failed, go back to cellular */
-                        ESP_LOGW(TAG, "WiFi VPN failed, reverting to cellular");
+                        /* WiFi VPN failed — cellular is still warm, reuse it */
+                        ESP_LOGW(TAG, "WiFi VPN failed, reverting to cellular (modem still warm)");
                         wifi_stop();
-                        goto try_cellular;
+                        s_ctx.active_transport = ML_NET_CELLULAR;
+
+                        /* Re-start VPN over cellular (modem already connected) */
+                        vpn_err = vpn_start();
+                        if (vpn_err == ESP_OK) {
+                            s_ctx.state = ML_NET_SW_CELL_VPN_UP;
+                            if (s_ctx.on_connected) {
+                                s_ctx.on_connected(ML_NET_CELLULAR, s_ctx.user_data);
+                            }
+                            xTimerStart(s_ctx.health_timer, 0);
+                            if (s_ctx.failback_check_ms > 0 && s_ctx.failback_timer) {
+                                xTimerStart(s_ctx.failback_timer, 0);
+                            }
+                        } else {
+                            /* Both failed — full restart */
+                            ESP_LOGE(TAG, "Both WiFi and cellular VPN failed, full restart");
+                            cellular_stop();
+                            s_ctx.state = ML_NET_SW_ERROR;
+                            if (s_ctx.on_disconnected) {
+                                s_ctx.on_disconnected(s_ctx.user_data);
+                            }
+                            vTaskDelay(pdMS_TO_TICKS(5000));
+                            if (s_ctx.running) goto try_cellular;
+                        }
                     }
                 } else {
                     /* WiFi still down, stay on cellular */
@@ -560,6 +627,11 @@ esp_err_t ml_net_switch_init(const ml_net_switch_config_t *config)
                                              pdTRUE, NULL, failback_timer_cb);
     }
 
+    /* Create WiFi disconnect debounce timer (one-shot) */
+    s_ctx.wifi_debounce_timer = xTimerCreate("wifi_debounce",
+                                              pdMS_TO_TICKS(WIFI_DISCONNECT_DEBOUNCE_MS),
+                                              pdFALSE, NULL, wifi_debounce_cb);
+
     s_ctx.state = ML_NET_SW_IDLE;
     s_ctx.initialized = true;
 
@@ -582,6 +654,9 @@ void ml_net_switch_deinit(void)
     }
     if (s_ctx.failback_timer) {
         xTimerDelete(s_ctx.failback_timer, portMAX_DELAY);
+    }
+    if (s_ctx.wifi_debounce_timer) {
+        xTimerDelete(s_ctx.wifi_debounce_timer, portMAX_DELAY);
     }
     if (s_ctx.wifi_events) {
         vEventGroupDelete(s_ctx.wifi_events);
@@ -616,6 +691,8 @@ esp_err_t ml_net_switch_stop(void)
     /* Stop timers */
     if (s_ctx.health_timer) xTimerStop(s_ctx.health_timer, portMAX_DELAY);
     if (s_ctx.failback_timer) xTimerStop(s_ctx.failback_timer, portMAX_DELAY);
+    if (s_ctx.wifi_debounce_timer) xTimerStop(s_ctx.wifi_debounce_timer, portMAX_DELAY);
+    s_ctx.wifi_disconnect_pending = false;
 
     /* Wake task so it exits */
     if (s_ctx.task_handle) {
