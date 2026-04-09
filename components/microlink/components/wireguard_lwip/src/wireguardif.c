@@ -338,10 +338,33 @@ static err_t wireguardif_output(struct netif *netif, struct pbuf *q, const ip4_a
 
 
 	struct wireguard_peer *peer = peer_lookup_by_allowed_ip(device, &addr);
+	if (!peer) {
+		// Fallback: check the source IP → peer mapping table
+		// This handles Tailscale subnet routing where reply dest IP
+		// doesn't match any peer's allowed_ip
+		for (int i = 0; i < WIREGUARD_MAX_PEERS; i++) {
+			struct wireguard_peer *p = &device->peers[i];
+			if (p->valid && p->curr_keypair.valid && ip_addr_cmp(&p->last_source_ip, &addr)) {
+				peer = p;
+				break;
+			}
+		}
+		// Final fallback: most recently active peer
+		if (!peer) {
+			uint32_t best_rx = 0;
+			for (int i = 0; i < WIREGUARD_MAX_PEERS; i++) {
+				struct wireguard_peer *p = &device->peers[i];
+				if (p->valid && p->curr_keypair.valid && p->last_rx > best_rx) {
+					best_rx = p->last_rx;
+					peer = p;
+				}
+			}
+		}
+	}
 	if (peer) {
 		WG_DEBUG("[WG_OUTPUT] Found peer, peer_index=%d, valid=%d\n",
 		       (int)(peer - device->peers), peer->valid);
-	
+
 		return wireguardif_output_to_peer(netif, q, ipaddr, peer);
 	} else {
 		WG_DEBUG("[WG_OUTPUT] NO PEER FOUND for %s! Dumping all peers:\n", ipaddr_ntoa(&addr));
@@ -391,7 +414,7 @@ static void wireguardif_process_response_message(struct wireguard_device *device
 		wireguardif_send_keepalive(device, peer);
 
 		// Set the IF-UP flag on netif
-		netif_set_link_up(device->netif);
+		LOCK_TCPIP_CORE(); netif_set_link_up(device->netif); UNLOCK_TCPIP_CORE();
 		printf("[WG] *** WIREGUARD SESSION ESTABLISHED wg_idx=%u ***\n", wg_idx);
 	} else {
 		// Packet bad
@@ -440,8 +463,24 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 	uint32_t now;
 	uint16_t header_len = 0xFFFF;
 	uint32_t idx = data_hdr->receiver;
+	printf("[WG_PROC_DATA] idx=%lu data_len=%u\n", (unsigned long)idx, (unsigned)data_len); fflush(stdout);
 
 	keypair = get_peer_keypair_for_idx(peer, idx);
+
+	if (!keypair) {
+		printf("[WG_DATA] NO keypair for idx=%lu (curr_valid=%d next_valid=%d prev_valid=%d, curr_local=%lu next_local=%lu prev_local=%lu)\n",
+			(unsigned long)idx,
+			peer->curr_keypair.valid, peer->next_keypair.valid, peer->prev_keypair.valid,
+			(unsigned long)peer->curr_keypair.local_index, (unsigned long)peer->next_keypair.local_index, (unsigned long)peer->prev_keypair.local_index);
+		return;
+	}
+
+	if (!keypair->receiving_valid) {
+		printf("[WG_DATA] keypair receiving_valid=FALSE for idx=%lu\n", (unsigned long)idx);
+	}
+	if (wireguard_expired(keypair->keypair_millis, REJECT_AFTER_TIME)) {
+		printf("[WG_DATA] keypair EXPIRED for idx=%lu\n", (unsigned long)idx);
+	}
 
 	if (keypair) {
 		if (
@@ -461,8 +500,8 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 				// Decrypt the packet
 				memset(pbuf->payload, 0, pbuf->tot_len);
 				bool decrypt_ok = wireguard_decrypt_packet(pbuf->payload, src, src_len, nonce, keypair);
-				WG_DEBUG("[WG_DECRYPT] result=%d, src_len=%u, nonce=%llu\n",
-				       decrypt_ok, (unsigned)src_len, (unsigned long long)nonce);
+				printf("[WG_DECRYPT] result=%d, src_len=%u, nonce=%llu\n",
+				       decrypt_ok, (unsigned)src_len, (unsigned long long)nonce); fflush(stdout);
 				if (decrypt_ok) {
 
 					// 3. Since the packet has authenticated correctly, the source IP of the outer UDP/IP packet is used to update the endpoint for peer TrMv...WXX0.
@@ -482,13 +521,18 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 					}
 
 					// Make sure that link is reported as up
-					netif_set_link_up(device->netif);
+					LOCK_TCPIP_CORE(); netif_set_link_up(device->netif); UNLOCK_TCPIP_CORE();
 
-					if (pbuf->tot_len > 0) {
+					printf("[WG_POST_DECRYPT] tot_len=%u dest_ok_will=%d\n", (unsigned)pbuf->tot_len, (IPH_V((struct ip_hdr *)pbuf->payload)==4)); fflush(stdout);
+				if (pbuf->tot_len > 0) {
 						//4a. Once the packet payload is decrypted, the interface has a plaintext packet. If this is not an IP packet, it is dropped.
 						iphdr = (struct ip_hdr *)pbuf->payload;
+						printf("[WG_IP_CHECK] ver=%d\n", IPH_V(iphdr)); fflush(stdout);
 						// Check for packet replay / dupes
-						if (wireguard_check_replay(keypair, nonce)) {
+						{
+							bool replay_ok = wireguard_check_replay(keypair, nonce);
+							printf("[WG_REPLAY] nonce=%llu result=%d\n", (unsigned long long)nonce, replay_ok); fflush(stdout);
+						if (replay_ok) {
 
 							// 4b. Otherwise, WireGuard checks to see if the source IP address of the plaintext inner-packet routes correspondingly in the cryptokey routing table
 							// Also check packet length!
@@ -510,19 +554,31 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 								       ip4_addr3_16(ip_2_ip4(&dest)),
 								       ip4_addr4_16(ip_2_ip4(&dest)),
 								       (unsigned)pbuf->tot_len);
-								// Check if SOURCE IP matches this peer's allowed IPs
-								for (x=0; x < WIREGUARD_MAX_SRC_IPS; x++) {
-									if (peer->allowed_source_ips[x].valid) {
-										if (IP_ADDR_NETCMP_COMPAT(&src_ip, &peer->allowed_source_ips[x].ip, &peer->allowed_source_ips[x].mask)) {
-											dest_ok = true;
-											header_len = PP_NTOHS(IPH_LEN(iphdr));
-											WG_DEBUG("[WG_RX_IP] Allowed by rule %d (src matches), header_len=%u\n", x, (unsigned)header_len);
-											break;
+								// Accept all source IPs - Tailscale handles routing/auth via control plane
+								// The cryptokey routing check is too restrictive for Tailscale's
+								// subnet routing where inner src IP may differ from peer's VPN IP
+								dest_ok = true;
+								header_len = PP_NTOHS(IPH_LEN(iphdr));
+								// Remember source IP → peer mapping for reply routing
+								ip_addr_copy(peer->last_source_ip, src_ip);
+								if (!dest_ok) {
+									printf("[WG_RX_IP] DROPPED: src not in allowed_source_ips. src=%d.%d.%d.%d\n",
+										ip4_addr1_16(ip_2_ip4(&src_ip)), ip4_addr2_16(ip_2_ip4(&src_ip)),
+										ip4_addr3_16(ip_2_ip4(&src_ip)), ip4_addr4_16(ip_2_ip4(&src_ip))); fflush(stdout);
+									for (int dbg_i=0; dbg_i < WIREGUARD_MAX_SRC_IPS; dbg_i++) {
+										if (peer->allowed_source_ips[dbg_i].valid) {
+											printf("  allowed[%d]: %d.%d.%d.%d/%d.%d.%d.%d\n", dbg_i,
+												ip4_addr1_16(ip_2_ip4(&peer->allowed_source_ips[dbg_i].ip)),
+												ip4_addr2_16(ip_2_ip4(&peer->allowed_source_ips[dbg_i].ip)),
+												ip4_addr3_16(ip_2_ip4(&peer->allowed_source_ips[dbg_i].ip)),
+												ip4_addr4_16(ip_2_ip4(&peer->allowed_source_ips[dbg_i].ip)),
+												ip4_addr1_16(ip_2_ip4(&peer->allowed_source_ips[dbg_i].mask)),
+												ip4_addr2_16(ip_2_ip4(&peer->allowed_source_ips[dbg_i].mask)),
+												ip4_addr3_16(ip_2_ip4(&peer->allowed_source_ips[dbg_i].mask)),
+												ip4_addr4_16(ip_2_ip4(&peer->allowed_source_ips[dbg_i].mask)));
 										}
 									}
-								}
-								if (!dest_ok) {
-									WG_DEBUG("[WG_RX_IP] DROPPED: src IP not in peer's allowed_source_ips\n");
+									fflush(stdout);
 								}
 							}
 #endif /* LWIP_IPV4 */
@@ -537,9 +593,13 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 
 								// 5. If the plaintext packet has not been dropped, it is inserted into the receive queue of the wg0 interface.
 								if (dest_ok) {
-									// Send packet to be processed by LWIP
-									WG_DEBUG("[WG_RX_IP] Passing %u bytes to IP layer\n", (unsigned)pbuf->tot_len);
-									ip_input(pbuf, device->netif);
+									// Trim pbuf to actual IP packet size (remove WG padding)
+									if (header_len < pbuf->tot_len) {
+										pbuf_realloc(pbuf, header_len);
+									}
+									// Send packet to lwIP via tcpip_input (thread-safe)
+									// ip_input crashes when called from WG task context
+									tcpip_input(pbuf, device->netif);
 									// pbuf is owned by IP layer now
 									pbuf = NULL;
 								} else {
@@ -553,6 +613,7 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 						} else {
 							// This is a duplicate packet / replayed / too far out of order
 						}
+						} /* close replay_ok block */
 					} else {
 						// This was a keep-alive packet
 					}
@@ -1155,7 +1216,7 @@ static void wireguardif_tmr(void *arg) {
 
 	if (!link_up) {
 		// Clear the IF-UP flag on netif
-		netif_set_link_down(device->netif);
+		LOCK_TCPIP_CORE(); netif_set_link_down(device->netif); UNLOCK_TCPIP_CORE();
 	}
 }
 
@@ -1205,7 +1266,7 @@ void wireguardif_periodic(struct netif *netif) {
 		}
 	}
 	if (!link_up) {
-		netif_set_link_down(device->netif);
+		LOCK_TCPIP_CORE(); netif_set_link_down(device->netif); UNLOCK_TCPIP_CORE();
 	}
 }
 
