@@ -57,7 +57,11 @@ extern "C" {
 
 #define ML_TASK_WG_MGR_STACK    (8 * 1024)
 #define ML_TASK_WG_MGR_PRIO     7
-#define ML_TASK_WG_MGR_CORE     1
+/* Pinned to CPU 0 (not 1) so the heavy crypto workload (x25519 in
+ * wireguard_peer_init and wireguard_create_handshake_initiation, ~500ms each
+ * on refc) does not starve ESPHome's loopTask on CPU 1. With 14 SaaS peers
+ * back-to-back, leaving wg_mgr on CPU 1 tripped loopTask task_wdt. */
+#define ML_TASK_WG_MGR_CORE     0
 
 /* Queue depths */
 #define ML_DERP_TX_QUEUE_DEPTH  16
@@ -242,6 +246,11 @@ typedef struct {
     uint32_t vpn_ip;
     uint8_t public_key[32];
     uint8_t disco_key[32];
+    /* Precomputed NaCl box shared key (x25519 DH of disco_key × our disco_private_key).
+     * Computed once in add_peer() so each DISCO packet only costs Salsa20+Poly1305
+     * instead of a full x25519 scalar-mult (~500ms on ESP32-S3 refc). */
+    uint8_t disco_shared_key[32];
+    bool has_disco_shared_key;
     char hostname[64];
     bool active;
 
