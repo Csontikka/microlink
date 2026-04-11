@@ -39,6 +39,222 @@ static const char *TAG = "ml_coord";
 /* Effective control plane host: NVS override or compiled default */
 #define CTRL_HOST(ml) ((ml)->ctrl_host[0] ? (ml)->ctrl_host : ML_CTRL_HOST)
 
+/* ============================================================================
+ * Custom control plane helpers (host:port parse + Noise pubkey fetch)
+ * ==========================================================================
+ *
+ * When ctrl_host is set (Headscale / Ionscale / custom coordinator), we:
+ *   1. Parse host + port out of strings like "host", "host:port",
+ *      "http://host" or "http://host:port".  https:// is rejected.
+ *   2. Fetch the server's Noise static public key from /key?v=88 on the
+ *      parsed host:port BEFORE the Noise handshake.  This is the Tailscale-
+ *      compatible endpoint that Headscale mimics.  The returned JSON has
+ *      a "publicKey":"mkey:<64 hex>" field; we hex-decode the 32-byte key
+ *      and feed it to ml_noise_init() so ChaCha20-Poly1305 can actually
+ *      authenticate against the server's real keypair instead of the
+ *      hardcoded Tailscale SaaS fallback.
+ */
+
+/* Parse "[http://]host[:port]" into bare host and decimal port string.
+ * Default port is "80".  https:// is rejected (TLS is out of scope).
+ * Returns 0 on success, -1 on error. */
+static int parse_host_port(const char *in,
+                           char *host_out, size_t host_sz,
+                           char *port_out, size_t port_sz) {
+    if (!in || !host_out || !port_out || host_sz == 0 || port_sz == 0) return -1;
+
+    const char *p = in;
+
+    /* Strip scheme */
+    if (strncasecmp(p, "http://", 7) == 0) {
+        p += 7;
+    } else if (strncasecmp(p, "https://", 8) == 0) {
+        ESP_LOGE(TAG, "https:// control plane URL is not supported (TLS unimplemented): %s", in);
+        return -1;
+    }
+
+    /* Find ':' for port separator, stop at '/' (path) or end */
+    const char *colon = NULL;
+    const char *slash = NULL;
+    for (const char *q = p; *q; q++) {
+        if (*q == ':' && !colon) colon = q;
+        if (*q == '/') { slash = q; break; }
+    }
+
+    const char *host_end = slash ? slash : (p + strlen(p));
+    if (colon && colon < host_end) host_end = colon;
+
+    size_t host_len = (size_t)(host_end - p);
+    if (host_len == 0 || host_len >= host_sz) {
+        ESP_LOGE(TAG, "parse_host_port: host too long or empty in '%s'", in);
+        return -1;
+    }
+    memcpy(host_out, p, host_len);
+    host_out[host_len] = '\0';
+
+    /* Port */
+    if (colon && colon < (slash ? slash : (p + strlen(p)))) {
+        const char *port_start = colon + 1;
+        const char *port_end = slash ? slash : (port_start + strlen(port_start));
+        size_t port_len = (size_t)(port_end - port_start);
+        if (port_len == 0 || port_len >= port_sz) {
+            ESP_LOGE(TAG, "parse_host_port: port too long or empty in '%s'", in);
+            return -1;
+        }
+        memcpy(port_out, port_start, port_len);
+        port_out[port_len] = '\0';
+        /* Validate digits */
+        for (size_t i = 0; i < port_len; i++) {
+            if (port_out[i] < '0' || port_out[i] > '9') {
+                ESP_LOGE(TAG, "parse_host_port: non-numeric port in '%s'", in);
+                return -1;
+            }
+        }
+    } else {
+        strncpy(port_out, "80", port_sz - 1);
+        port_out[port_sz - 1] = '\0';
+    }
+    return 0;
+}
+
+/* Decode one hex char; returns 0-15 or -1. */
+static int hex_nybble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+}
+
+/* Hex-decode exactly 64 chars into 32 bytes. Returns 0 on success. */
+static int hex_to_bytes32(const char *hex, uint8_t out[32]) {
+    for (int i = 0; i < 32; i++) {
+        int hi = hex_nybble(hex[i * 2]);
+        int lo = hex_nybble(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return -1;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return 0;
+}
+
+/* Open a short-lived TCP connection to host:port, GET /key?v=88, parse JSON
+ * body, extract publicKey, hex-decode into ml->ctrl_noise_pubkey.
+ * Returns 0 on success, -1 on any failure. Closes its own socket. */
+static int fetch_server_pubkey(microlink_t *ml, const char *host, const char *port) {
+    int sock = -1;
+    struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM };
+    struct addrinfo *res = NULL;
+    int rc = -1;
+
+    ESP_LOGI(TAG, "Fetching Noise server pubkey from http://%s:%s/key?v=88", host, port);
+
+    if (ml_getaddrinfo(host, port, &hints, &res) != 0 || !res) {
+        ESP_LOGE(TAG, "fetch_server_pubkey: DNS resolve failed for %s", host);
+        goto out;
+    }
+
+    sock = ml_socket(res->ai_family, SOCK_STREAM, IPPROTO_TCP);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "fetch_server_pubkey: socket() failed");
+        goto out;
+    }
+
+    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+    ml_setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ml_setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    if (ml_connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
+        ESP_LOGE(TAG, "fetch_server_pubkey: connect() failed: errno=%d", errno);
+        goto out;
+    }
+
+    char req[256];
+    int req_len = snprintf(req, sizeof(req),
+        "GET /key?v=88 HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "User-Agent: microlink\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        host);
+    if (req_len <= 0 || req_len >= (int)sizeof(req)) goto out;
+
+    if (ml_send(sock, (uint8_t *)req, req_len, 0) != req_len) {
+        ESP_LOGE(TAG, "fetch_server_pubkey: send failed");
+        goto out;
+    }
+
+    /* Read full response (headers + body).  Response is small (~200 bytes). */
+    char resp[2048];
+    int total = 0;
+    while (total < (int)sizeof(resp) - 1) {
+        int n = ml_recv(sock, (uint8_t *)resp + total, sizeof(resp) - 1 - total, 0);
+        if (n <= 0) break;
+        total += n;
+    }
+    if (total <= 0) {
+        ESP_LOGE(TAG, "fetch_server_pubkey: empty HTTP response");
+        goto out;
+    }
+    resp[total] = '\0';
+
+    /* Find header/body boundary */
+    char *body = strstr(resp, "\r\n\r\n");
+    if (!body) {
+        ESP_LOGE(TAG, "fetch_server_pubkey: no header terminator in response");
+        goto out;
+    }
+    body += 4;
+
+    /* Handle chunked transfer encoding: skip the first hex length line. */
+    if (strstr(resp, "Transfer-Encoding: chunked") ||
+        strstr(resp, "transfer-encoding: chunked") ||
+        strstr(resp, "TRANSFER-ENCODING: CHUNKED")) {
+        char *chunk_end = strstr(body, "\r\n");
+        if (!chunk_end) {
+            ESP_LOGE(TAG, "fetch_server_pubkey: chunked body malformed");
+            goto out;
+        }
+        body = chunk_end + 2;
+    }
+
+    /* Parse JSON: {"legacyPublicKey":"mkey:...","publicKey":"mkey:<64 hex>"} */
+    cJSON *root = cJSON_Parse(body);
+    if (!root) {
+        ESP_LOGE(TAG, "fetch_server_pubkey: JSON parse failed; body='%s'", body);
+        goto out;
+    }
+    cJSON *pk = cJSON_GetObjectItem(root, "publicKey");
+    if (!cJSON_IsString(pk) || !pk->valuestring) {
+        ESP_LOGE(TAG, "fetch_server_pubkey: no publicKey field in JSON");
+        cJSON_Delete(root);
+        goto out;
+    }
+    const char *s = pk->valuestring;
+    /* Strip "mkey:" prefix if present */
+    if (strncmp(s, "mkey:", 5) == 0) s += 5;
+    if (strlen(s) != 64) {
+        ESP_LOGE(TAG, "fetch_server_pubkey: publicKey wrong length (%d, want 64)", (int)strlen(s));
+        cJSON_Delete(root);
+        goto out;
+    }
+    if (hex_to_bytes32(s, ml->ctrl_noise_pubkey) != 0) {
+        ESP_LOGE(TAG, "fetch_server_pubkey: hex decode failed");
+        cJSON_Delete(root);
+        goto out;
+    }
+    cJSON_Delete(root);
+    ml->ctrl_noise_pubkey_valid = true;
+    ESP_LOGI(TAG, "Fetched Noise server pubkey: %02x%02x%02x%02x...%02x%02x",
+             ml->ctrl_noise_pubkey[0], ml->ctrl_noise_pubkey[1],
+             ml->ctrl_noise_pubkey[2], ml->ctrl_noise_pubkey[3],
+             ml->ctrl_noise_pubkey[30], ml->ctrl_noise_pubkey[31]);
+    rc = 0;
+
+out:
+    if (sock >= 0) ml_close_sock(sock);
+    if (res) ml_freeaddrinfo(res);
+    return rc;
+}
+
 /* NodeKeyChallenge from EarlyNoise (stored between handshake and register) */
 static uint8_t s_node_key_challenge[32] = {0};
 static bool s_has_node_key_challenge = false;
@@ -222,13 +438,40 @@ static int noise_recv(microlink_t *ml, ml_noise_state_t *noise,
 static int do_tcp_connect(microlink_t *ml) {
     int64_t t_start = esp_timer_get_time();
 
-    ESP_LOGI(TAG, "Resolving %s...", CTRL_HOST(ml));
+    /* Parse host+port out of ctrl_host once per attempt.  When ctrl_host is
+     * empty we are talking to Tailscale SaaS on port 80, so fill the parsed
+     * fields with ML_CTRL_HOST and "80". */
+    if (ml->ctrl_host[0]) {
+        if (parse_host_port(ml->ctrl_host,
+                            ml->ctrl_host_parsed, sizeof(ml->ctrl_host_parsed),
+                            ml->ctrl_port_str, sizeof(ml->ctrl_port_str)) != 0) {
+            ESP_LOGE(TAG, "Invalid login_server '%s'", ml->ctrl_host);
+            return -1;
+        }
+    } else {
+        strncpy(ml->ctrl_host_parsed, ML_CTRL_HOST, sizeof(ml->ctrl_host_parsed) - 1);
+        ml->ctrl_host_parsed[sizeof(ml->ctrl_host_parsed) - 1] = '\0';
+        strncpy(ml->ctrl_port_str, "80", sizeof(ml->ctrl_port_str) - 1);
+        ml->ctrl_port_str[sizeof(ml->ctrl_port_str) - 1] = '\0';
+    }
+
+    /* Build "Host:" / HTTP/2 :authority value.  Standard HTTP practice:
+     * omit the port suffix when it is the scheme default (80 for plain
+     * HTTP), include it otherwise. */
+    if (strcmp(ml->ctrl_port_str, "80") == 0) {
+        snprintf(ml->ctrl_host_hdr, sizeof(ml->ctrl_host_hdr), "%s", ml->ctrl_host_parsed);
+    } else {
+        snprintf(ml->ctrl_host_hdr, sizeof(ml->ctrl_host_hdr), "%s:%s",
+                 ml->ctrl_host_parsed, ml->ctrl_port_str);
+    }
+
+    ESP_LOGI(TAG, "Resolving %s (port %s)...", ml->ctrl_host_parsed, ml->ctrl_port_str);
 
     struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM };
     struct addrinfo *res = NULL;
 
-    if (ml_getaddrinfo(CTRL_HOST(ml), "80", &hints, &res) != 0 || !res) {
-        ESP_LOGE(TAG, "DNS resolve failed for %s", CTRL_HOST(ml));
+    if (ml_getaddrinfo(ml->ctrl_host_parsed, ml->ctrl_port_str, &hints, &res) != 0 || !res) {
+        ESP_LOGE(TAG, "DNS resolve failed for %s", ml->ctrl_host_parsed);
         return -1;
     }
 
@@ -257,7 +500,7 @@ static int do_tcp_connect(microlink_t *ml) {
     ml_setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
     ml_setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
 
-    ESP_LOGI(TAG, "Connecting to %s:80...", CTRL_HOST(ml));
+    ESP_LOGI(TAG, "Connecting to %s:%s...", ml->ctrl_host_parsed, ml->ctrl_port_str);
 
     if (ml_connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
         ESP_LOGE(TAG, "TCP connect failed: %d", errno);
@@ -286,10 +529,28 @@ static int s_server_extra_data_len = 0;
 static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
     int64_t t_noise_start = esp_timer_get_time();
 
-    /* Initialize Noise state with our machine key and Tailscale's server key */
+    /* For custom control planes (Headscale / Ionscale / dev coordinator),
+     * each instance generates its own Noise keypair, so the hardcoded
+     * Tailscale SaaS server pubkey in ml_noise_init will always fail the
+     * ChaCha20-Poly1305 machine-key decrypt.  Fetch the real server pubkey
+     * from /key?v=88 here, once, and cache it on ml. */
+    const uint8_t *server_pubkey = NULL;
+    if (ml->ctrl_host[0]) {
+        if (!ml->ctrl_noise_pubkey_valid) {
+            if (fetch_server_pubkey(ml, ml->ctrl_host_parsed, ml->ctrl_port_str) != 0) {
+                ESP_LOGE(TAG, "Failed to fetch Noise server pubkey from %s:%s",
+                         ml->ctrl_host_parsed, ml->ctrl_port_str);
+                return -1;
+            }
+        }
+        server_pubkey = ml->ctrl_noise_pubkey;
+    }
+
+    /* Initialize Noise state with our machine key and the server's Noise
+     * static public key (NULL = fall back to hardcoded Tailscale SaaS key) */
     ml_noise_init(noise,
                    ml->machine_private_key, ml->machine_public_key,
-                   NULL);  /* NULL = use default Tailscale server key */
+                   server_pubkey);
 
     /* Build Noise message 1 (101 bytes) */
     uint8_t msg1[128];
@@ -319,7 +580,7 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
         "X-Tailscale-Handshake: %s\r\n"
         "Content-Length: 0\r\n"
         "\r\n",
-        CTRL_HOST(ml), msg1_b64);
+        ml->ctrl_host_hdr, msg1_b64);
 
     ESP_LOGI(TAG, "Sending Noise handshake (msg1=%d bytes, b64=%d chars)", (int)msg1_len, (int)b64_len);
 
@@ -771,7 +1032,7 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     /* HEADERS frame (POST /machine/register) */
     int hdr_len = ml_h2_build_headers_frame(h2_buf + h2_pos, json_len + 512 - h2_pos,
                                               "POST", "/machine/register",
-                                              CTRL_HOST(ml), "application/json",
+                                              ml->ctrl_host_hdr, "application/json",
                                               1, false);
     if (hdr_len < 0) { free(json_str); free(h2_buf); return -1; }
     h2_pos += hdr_len;
@@ -1365,7 +1626,7 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
 
     int hdr_len = ml_h2_build_headers_frame(h2_buf + h2_pos, json_len + 512,
                                               "POST", "/machine/map",
-                                              CTRL_HOST(ml), "application/json",
+                                              ml->ctrl_host_hdr, "application/json",
                                               3, false);
     if (hdr_len < 0) { free(json_str); free(h2_buf); return -1; }
     h2_pos += hdr_len;
@@ -1857,7 +2118,7 @@ static int do_start_long_poll(microlink_t *ml, ml_noise_state_t *noise) {
     int h2_pos = 0;
     int hdr_len = ml_h2_build_headers_frame(h2_buf, json_len + 512,
                                               "POST", "/machine/map",
-                                              CTRL_HOST(ml), "application/json",
+                                              ml->ctrl_host_hdr, "application/json",
                                               5, false);
     if (hdr_len < 0) { free(json_str); free(h2_buf); return -1; }
     h2_pos += hdr_len;
@@ -1959,7 +2220,7 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
     int h2_pos = 0;
     int hdr_len = ml_h2_build_headers_frame(h2_buf, json_len + 512,
                                               "POST", "/machine/map",
-                                              CTRL_HOST(ml), "application/json",
+                                              ml->ctrl_host_hdr, "application/json",
                                               sid, false);
     if (hdr_len < 0) { free(json_str); free(h2_buf); return -1; }
     h2_pos += hdr_len;

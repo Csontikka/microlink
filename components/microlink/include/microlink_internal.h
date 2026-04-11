@@ -442,8 +442,24 @@ struct microlink_s {
     char nvs_device_name[48];
 
     /* Control plane host override (empty = use ML_CTRL_HOST default).
-     * Set from NVS at boot for Headscale/Ionscale/custom coordinators. */
+     * Set from NVS at boot for Headscale/Ionscale/custom coordinators.
+     * May be a bare hostname, "host:port", or "http://host[:port]". */
     char ctrl_host[64];
+
+    /* Parsed host and port from ctrl_host (filled lazily by do_tcp_connect).
+     * ctrl_host_parsed is the bare hostname/IP, ctrl_port_str the port as
+     * decimal string (default "80"), ctrl_host_hdr is the value to use in
+     * HTTP "Host:" / HTTP/2 ":authority" (host, plus ":port" iff non-80). */
+    char ctrl_host_parsed[64];
+    char ctrl_port_str[8];
+    char ctrl_host_hdr[72];
+
+    /* Noise server static public key fetched from the custom control plane
+     * via GET /key?v=88. Valid only when ctrl_noise_pubkey_valid is true;
+     * otherwise ml_noise_init falls back to the hardcoded Tailscale SaaS
+     * server key. */
+    uint8_t ctrl_noise_pubkey[32];
+    bool ctrl_noise_pubkey_valid;
 
     /* Debug flags (bitmask from NVS, checked at runtime for verbose logging) */
     uint8_t debug_flags;  /* bit 0: DISCO, bit 1: WG, bit 2: DERP, bit 3: coord */
