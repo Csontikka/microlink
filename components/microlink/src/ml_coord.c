@@ -1581,9 +1581,13 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
     snprintf(key_str, sizeof(key_str), "discokey:%s", key_hex);
     cJSON_AddStringToObject(root, "DiscoKey", key_str);
 
-    /* Stream=false for initial fetch */
-    cJSON_AddBoolToObject(root, "Stream", false);
+    /* Stream=true: open the long-poll stream and receive the initial MapResponse
+     * chunk (length-prefixed) as the first payload. Headscale v0.28's non-streaming
+     * serve() path never writes a MapResponse body for OmitPeers=false requests,
+     * so we must use the streaming path for the initial peer/DERPMap fetch. */
+    cJSON_AddBoolToObject(root, "Stream", true);
     cJSON_AddBoolToObject(root, "KeepAlive", true);
+    cJSON_AddBoolToObject(root, "OmitPeers", false);  /* Want full initial state */
     cJSON_AddStringToObject(root, "Compress", "");  /* Disable compression */
 
     /* Hostinfo */
@@ -1607,8 +1611,9 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
         cJSON_AddItemToObject(hostinfo, "NetInfo", netinfo);
     }
 
-    /* Include endpoints if STUN has already completed (Stream=false →
-     * control plane processes these, unlike Stream=true with Version >= 68) */
+    /* Include endpoints if STUN has already completed. With Version >= 68
+     * control planes ignore Endpoints on Stream=true MapRequests, so these
+     * are primarily updated via do_send_endpoint_update() after STUN lands. */
     add_endpoints_to_json(ml, root);
 
     char *json_str = cJSON_PrintUnformatted(root);
@@ -1616,9 +1621,11 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
     if (!json_str) return -1;
 
     size_t json_len = strlen(json_str);
-    ESP_LOGI(TAG, "MapRequest: %d bytes (Stream=false)", (int)json_len);
+    ESP_LOGI(TAG, "MapRequest: %d bytes (Stream=true, initial long-poll)", (int)json_len);
 
-    /* Build H2 HEADERS + DATA, stream ID 3 (stream 1 was register) */
+    /* Build H2 HEADERS + DATA on stream ID 5 (the long-poll stream).
+     * Stream 1 was the /machine/register request. poll_map_update() below
+     * reads subsequent delta chunks from this same stream. */
     uint8_t *h2_buf = ml_psram_malloc(json_len + 512);
     if (!h2_buf) { free(json_str); return -1; }
 
@@ -1627,13 +1634,13 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
     int hdr_len = ml_h2_build_headers_frame(h2_buf + h2_pos, json_len + 512,
                                               "POST", "/machine/map",
                                               ml->ctrl_host_hdr, "application/json",
-                                              3, false);
+                                              5, false);
     if (hdr_len < 0) { free(json_str); free(h2_buf); return -1; }
     h2_pos += hdr_len;
 
     int data_len = ml_h2_build_data_frame(h2_buf + h2_pos, json_len + 512 - h2_pos,
                                             (uint8_t *)json_str, json_len,
-                                            3, true);
+                                            5, true);
     free(json_str);
     if (data_len < 0) { free(h2_buf); return -1; }
     h2_pos += data_len;
@@ -1647,17 +1654,26 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
     int64_t t_map_sent = esp_timer_get_time();
     ESP_LOGI(TAG, "[TIMING] MapRequest send: %lld ms", (t_map_sent - t_map_start) / 1000);
 
-    /* Read MapResponse - accumulate ALL decrypted Noise frames first, then parse H2.
-     * This is critical because a single H2 frame can span multiple Noise frames
-     * (v1 does the same with h2_buffer).
-     * Smart timeout: extend to 60s for large tailnets (300+ peers = 240KB+). */
+    /* Read the initial MapResponse chunk from the streaming long-poll.
+     *
+     * Framing: Stream=true MapResponses are length-prefixed — each chunk is
+     * [4-byte big-endian length][JSON body]. The server keeps the H2 stream
+     * open for subsequent delta chunks; there is NO END_STREAM to signal the
+     * end of the first chunk. We must parse the length prefix to know when
+     * we've got the complete initial MapResponse.
+     *
+     * Strategy: accumulate decrypted Noise frames into h2_recv, parse complete
+     * H2 DATA frames on stream 5 into resp_buf (the response body), and stop
+     * once resp_buf has 4 + expected_len bytes. */
     uint8_t *h2_recv = ml_psram_malloc(ML_H2_BUFFER_SIZE);  /* 512KB for 300+ peer tailnets */
     if (!h2_recv) return -1;
     size_t h2_total = 0;
+    size_t h2_parsed = 0;  /* next unparsed byte in h2_recv */
 
     uint8_t *resp_buf = ml_psram_malloc(ML_JSON_BUFFER_SIZE);
     if (!resp_buf) { free(h2_recv); return -1; }
-    size_t json_total = 0;
+    size_t json_total = 0;         /* bytes of stream-5 DATA accumulated (incl prefix) */
+    uint32_t expected_body_len = 0; /* populated once we have the first 4 bytes */
 
     /* Set extended recv timeout for large MapResponse (60 seconds) */
     struct timeval rcv_tv = { .tv_sec = 60, .tv_usec = 0 };
@@ -1667,12 +1683,8 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
     uint64_t last_progress_ms = recv_start_ms;
     size_t window_consumed = 0;
 
-    /* Read all Noise frames and accumulate decrypted H2 data.
-     * Scan for H2 END_STREAM flag (0x01) on DATA frames to know when the
-     * response is complete — without this, we wait for the full recv timeout
-     * (60s) before proceeding, which dominates connection time on cellular. */
-    bool got_end_stream = false;
-    for (int read_count = 0; read_count < 200; read_count++) {
+    bool got_chunk = false;
+    for (int read_count = 0; read_count < 400; read_count++) {
         uint8_t *frame_buf = ml_psram_malloc(65536);
         if (!frame_buf) break;
 
@@ -1683,39 +1695,56 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
         }
 
         /* Append decrypted data to h2_recv */
-        if (h2_total + frame_len < ML_H2_BUFFER_SIZE) {
-            memcpy(h2_recv + h2_total, frame_buf, frame_len);
-            h2_total += frame_len;
-            window_consumed += frame_len;
-        } else {
-            ESP_LOGW(TAG, "H2 buffer full at %dKB, truncating", (int)(h2_total / 1024));
+        if (h2_total + frame_len >= ML_H2_BUFFER_SIZE) {
+            ESP_LOGW(TAG, "H2 recv buffer full at %dKB, truncating", (int)(h2_total / 1024));
             free(frame_buf);
             break;
         }
+        memcpy(h2_recv + h2_total, frame_buf, frame_len);
+        h2_total += frame_len;
+        window_consumed += frame_len;
         free(frame_buf);
 
-        /* Scan newly accumulated data for H2 END_STREAM flag.
-         * H2 frame header: 3 bytes length + 1 byte type + 1 byte flags + 4 bytes stream ID.
-         * DATA frame type=0x00, END_STREAM flag=0x01.
-         * We scan from the start each time since frames may span Noise boundaries. */
-        size_t scan_pos = 0;
-        while (scan_pos + 9 <= h2_total) {
-            uint32_t f_len = (h2_recv[scan_pos] << 16) | (h2_recv[scan_pos + 1] << 8) | h2_recv[scan_pos + 2];
-            uint8_t f_type = h2_recv[scan_pos + 3];
-            uint8_t f_flags = h2_recv[scan_pos + 4];
+        /* Parse any newly complete H2 frames. Only DATA frames on stream 5
+         * (the long-poll stream) contribute to the MapResponse body. Other
+         * frames (SETTINGS, PING, WINDOW_UPDATE, HEADERS) are accounted for
+         * but their payload is discarded here. */
+        while (h2_parsed + 9 <= h2_total) {
+            uint32_t f_len = (h2_recv[h2_parsed]     << 16) |
+                             (h2_recv[h2_parsed + 1] << 8)  |
+                              h2_recv[h2_parsed + 2];
+            uint8_t  f_type = h2_recv[h2_parsed + 3];
+            uint32_t f_stream = ((h2_recv[h2_parsed + 5] & 0x7F) << 24) |
+                                 (h2_recv[h2_parsed + 6] << 16) |
+                                 (h2_recv[h2_parsed + 7] << 8)  |
+                                  h2_recv[h2_parsed + 8];
+            if (h2_parsed + 9 + f_len > h2_total) break;  /* incomplete */
 
-            if (scan_pos + 9 + f_len > h2_total) break;  /* Incomplete frame */
-
-            if (f_type == 0x00 && (f_flags & 0x01)) {
-                /* DATA frame with END_STREAM — response is complete */
-                got_end_stream = true;
+            if (f_type == 0x00 && f_stream == 5 && f_len > 0) {
+                if (json_total + f_len < ML_JSON_BUFFER_SIZE) {
+                    memcpy(resp_buf + json_total, h2_recv + h2_parsed + 9, f_len);
+                    json_total += f_len;
+                }
             }
-            scan_pos += 9 + f_len;
+            h2_parsed += 9 + f_len;
         }
 
-        if (got_end_stream) {
-            ESP_LOGI(TAG, "H2 END_STREAM detected after %d Noise frames (%dKB, %lums)",
-                     read_count + 1, (int)(h2_total / 1024),
+        /* Learn expected body length from the 4-byte little-endian prefix.
+         * Tailscale and Headscale both use LE here (see headscale poll.go
+         * writeMap(): binary.LittleEndian.PutUint32). */
+        if (expected_body_len == 0 && json_total >= 4) {
+            expected_body_len = ((uint32_t)resp_buf[0])       |
+                                ((uint32_t)resp_buf[1] << 8)  |
+                                ((uint32_t)resp_buf[2] << 16) |
+                                ((uint32_t)resp_buf[3] << 24);
+            ESP_LOGI(TAG, "MapResponse length prefix: %lu bytes",
+                     (unsigned long)expected_body_len);
+        }
+
+        if (expected_body_len > 0 && json_total >= 4 + expected_body_len) {
+            got_chunk = true;
+            ESP_LOGI(TAG, "Initial MapResponse chunk complete: %lu bytes JSON (%d frames, %lums)",
+                     (unsigned long)expected_body_len, read_count + 1,
                      (unsigned long)(ml_get_time_ms() - recv_start_ms));
             break;
         }
@@ -1723,19 +1752,21 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
         /* Progress logging every 5 seconds for large responses */
         uint64_t now = ml_get_time_ms();
         if (now - last_progress_ms > 5000) {
-            ESP_LOGI(TAG, "MapResponse: received %dKB so far (%d frames, %lums elapsed)",
-                     (int)(h2_total / 1024), read_count + 1,
+            ESP_LOGI(TAG, "MapResponse: received %dKB / %luKB so far (%d frames, %lums elapsed)",
+                     (int)(json_total / 1024),
+                     (unsigned long)(expected_body_len / 1024),
+                     read_count + 1,
                      (unsigned long)(now - recv_start_ms));
             last_progress_ms = now;
         }
 
         /* Proactive WINDOW_UPDATE every 32KB to keep server sending.
-         * Must update BOTH connection-level (stream 0) AND stream-level (stream 3)
-         * windows, otherwise the server stalls when either window exhausts. */
+         * Must update BOTH connection-level (stream 0) AND stream-level
+         * (stream 5), otherwise the server stalls when either window exhausts. */
         if (window_consumed >= 32768) {
             uint8_t wu_buf[26];  /* 2 WINDOW_UPDATE frames: 13 bytes each */
             int wu_len = ml_h2_build_window_update(wu_buf, 13, 0, (uint32_t)window_consumed);
-            wu_len += ml_h2_build_window_update(wu_buf + wu_len, 13, 3, (uint32_t)window_consumed);
+            wu_len += ml_h2_build_window_update(wu_buf + wu_len, 13, 5, (uint32_t)window_consumed);
             if (wu_len > 0) {
                 noise_send(ml, noise, wu_buf, wu_len);
             }
@@ -1743,64 +1774,35 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
         }
     }
 
-    /* Restore normal recv timeout (5 seconds for long-poll) */
+    /* Restore normal recv timeout (5 seconds for long-poll delta reads) */
     rcv_tv.tv_sec = 5;
     ml_setsockopt(ml->coord_sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_tv, sizeof(rcv_tv));
 
-    ESP_LOGI(TAG, "Accumulated %dKB of H2 data from Noise frames (%lums)",
-             (int)(h2_total / 1024),
-             (unsigned long)(ml_get_time_ms() - recv_start_ms));
-
-    /* Now parse complete H2 frames from accumulated buffer */
-    int fpos = 0;
-    while (fpos + 9 <= (int)h2_total) {
-        uint32_t f_len = (h2_recv[fpos] << 16) | (h2_recv[fpos + 1] << 8) | h2_recv[fpos + 2];
-        uint8_t f_type = h2_recv[fpos + 3];
-        uint8_t f_flags = h2_recv[fpos + 4];
-        uint32_t f_stream = ((h2_recv[fpos + 5] & 0x7F) << 24) |
-                            (h2_recv[fpos + 6] << 16) |
-                            (h2_recv[fpos + 7] << 8) | h2_recv[fpos + 8];
-        fpos += 9;
-
-        ESP_LOGI(TAG, "  H2 frame: type=%d flags=0x%02x len=%lu stream=%lu",
-                 f_type, f_flags, (unsigned long)f_len, (unsigned long)f_stream);
-
-        if (fpos + (int)f_len > (int)h2_total) {
-            ESP_LOGW(TAG, "  Incomplete H2 frame at end (need %lu, have %d)",
-                     (unsigned long)f_len, (int)h2_total - fpos);
-            break;
-        }
-
-        if (f_type == 0x00 && f_len > 0) {  /* DATA frame */
-            if (json_total + f_len < ML_JSON_BUFFER_SIZE) {
-                memcpy(resp_buf + json_total, h2_recv + fpos, f_len);
-                json_total += f_len;
-            }
-        }
-
-        fpos += f_len;
-    }
     free(h2_recv);
 
-    /* Send connection-level WINDOW_UPDATE to replenish HTTP/2 flow control.
-     * Stream 3 is already closed (END_STREAM received), so only update stream 0.
-     * Without this, the server's connection-level window exhausts on large responses. */
-    if (json_total > 0) {
-        uint8_t wu_buf[13];
-        int wu_len = ml_h2_build_window_update(wu_buf, 13, 0, (uint32_t)json_total);
-        noise_send(ml, noise, wu_buf, wu_len);
-        ESP_LOGI(TAG, "Sent H2 WINDOW_UPDATE: %d bytes (connection level)", (int)json_total);
-    }
-
-    if (json_total == 0) {
-        ESP_LOGW(TAG, "Empty MapResponse");
+    if (!got_chunk || expected_body_len == 0 || json_total < 4 + expected_body_len) {
+        ESP_LOGW(TAG, "Initial MapResponse incomplete: got %d body bytes, expected %lu",
+                 (int)json_total, (unsigned long)expected_body_len);
         free(resp_buf);
         return -1;
     }
 
-    ESP_LOGI(TAG, "MapResponse JSON: %d bytes", (int)json_total);
+    /* Replenish HTTP/2 flow control for the data we consumed. Stream 5 stays
+     * OPEN for subsequent long-poll deltas, so update both windows. */
+    {
+        uint8_t wu_buf[26];
+        int wu_len = ml_h2_build_window_update(wu_buf, 13, 0, (uint32_t)json_total);
+        wu_len += ml_h2_build_window_update(wu_buf + wu_len, 13, 5, (uint32_t)json_total);
+        if (wu_len > 0) {
+            noise_send(ml, noise, wu_buf, wu_len);
+            ESP_LOGI(TAG, "Sent H2 WINDOW_UPDATE: %d bytes (stream 5 + conn)", (int)json_total);
+        }
+    }
 
-    /* Hex dump first 32 bytes for debugging prefix issues */
+    ESP_LOGI(TAG, "MapResponse JSON: %lu bytes (+ 4-byte prefix)",
+             (unsigned long)expected_body_len);
+
+    /* Hex dump first 32 bytes for debugging prefix/parse issues */
     {
         int dump = json_total < 32 ? (int)json_total : 32;
         char hexbuf[97];
@@ -1811,25 +1813,9 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
         ESP_LOGI(TAG, "MapResponse first %d bytes (hex): %s", dump, hexbuf);
     }
 
-    /* Check for length prefix (Tailscale binary framing: 4-byte big-endian length before JSON) */
-    char *parse_start = (char *)resp_buf;
-    size_t parse_len = json_total;
-
-    /* Find the start of JSON - look for '{' in first 8 bytes */
-    int json_offset = -1;
-    for (int i = 0; i < 8 && i < (int)json_total; i++) {
-        if (resp_buf[i] == '{') {
-            json_offset = i;
-            break;
-        }
-    }
-    if (json_offset > 0) {
-        ESP_LOGI(TAG, "JSON starts at offset %d (skipping %d-byte prefix)", json_offset, json_offset);
-        parse_start += json_offset;
-        parse_len -= json_offset;
-    } else if (json_offset < 0) {
-        ESP_LOGW(TAG, "No '{' found in first 8 bytes of MapResponse!");
-    }
+    /* Skip the 4-byte length prefix — the streaming framing is deterministic. */
+    char *parse_start = (char *)resp_buf + 4;
+    size_t parse_len = expected_body_len;
 
     /* Null-terminate */
     char saved = parse_start[parse_len];
@@ -2049,97 +2035,6 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
     return 0;
 }
 
-/* ============================================================================
- * State: LONG_POLL - Start streaming MapRequest + process incremental updates
- * ========================================================================== */
-
-/* Send MapRequest with Stream=true to start long-poll on H2 stream 5 */
-static int do_start_long_poll(microlink_t *ml, ml_noise_state_t *noise) {
-    cJSON *root = cJSON_CreateObject();
-    if (!root) return -1;
-
-    cJSON_AddNumberToObject(root, "Version", ML_CTRL_PROTOCOL_VER);
-
-    char key_hex[65], key_str[80];
-    bytes_to_hex(ml->wg_public_key, 32, key_hex);
-    snprintf(key_str, sizeof(key_str), "nodekey:%s", key_hex);
-    cJSON_AddStringToObject(root, "NodeKey", key_str);
-
-    bytes_to_hex(ml->disco_public_key, 32, key_hex);
-    snprintf(key_str, sizeof(key_str), "discokey:%s", key_hex);
-    cJSON_AddStringToObject(root, "DiscoKey", key_str);
-
-    /* Hostinfo - REQUIRED by control plane even for Stream=true.
-     * V1 includes this; without it, server may not keep us "online". */
-    cJSON *hostinfo = cJSON_CreateObject();
-    if (hostinfo) {
-        const char *dev_name = (ml->config.device_name && ml->config.device_name[0]) ? ml->config.device_name : microlink_default_device_name();
-        cJSON_AddStringToObject(hostinfo, "Hostname", dev_name);
-        cJSON_AddStringToObject(hostinfo, "OS", "linux");
-        cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
-        cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
-        cJSON_AddItemToObject(root, "Hostinfo", hostinfo);
-    }
-
-    /* NetInfo: tell control plane our preferred DERP region and NAT type.
-     * MUST be inside Hostinfo — the control plane reads Hostinfo.NetInfo.PreferredDERP
-     * to populate Node.HomeDERP for other peers. */
-    cJSON *netinfo = cJSON_CreateObject();
-    if (netinfo) {
-        cJSON_AddNumberToObject(netinfo, "PreferredDERP", ML_DERP_REGION);
-        if (ml->stun_nat_checked) {
-            cJSON_AddBoolToObject(netinfo, "MappingVariesByDestIP", ml->nat_mapping_varies);
-        }
-        cJSON_AddItemToObject(hostinfo, "NetInfo", netinfo);
-    }
-
-    /* Stream=true for long-poll, KeepAlive=true so server sends keepalives
-     * (which marks us as "online" on the control plane) */
-    cJSON_AddBoolToObject(root, "Stream", true);
-    cJSON_AddBoolToObject(root, "KeepAlive", true);
-    cJSON_AddStringToObject(root, "Compress", "");    /* Disable compression */
-    cJSON_AddBoolToObject(root, "OmitPeers", true);   /* Already have peers */
-
-    /* NOTE: With Version >= 68, the control plane IGNORES Endpoints and
-     * Hostinfo in Stream=true MapRequests. Endpoints are sent via separate
-     * do_send_endpoint_update() calls (Stream=false, OmitPeers=true). */
-
-    char *json_str = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-    if (!json_str) return -1;
-
-    size_t json_len = strlen(json_str);
-    ESP_LOGI(TAG, "MapRequest: %d bytes (Stream=true)", (int)json_len);
-
-    /* Build H2 frames on stream ID 5 */
-    uint8_t *h2_buf = ml_psram_malloc(json_len + 512);
-    if (!h2_buf) { free(json_str); return -1; }
-
-    int h2_pos = 0;
-    int hdr_len = ml_h2_build_headers_frame(h2_buf, json_len + 512,
-                                              "POST", "/machine/map",
-                                              ml->ctrl_host_hdr, "application/json",
-                                              5, false);
-    if (hdr_len < 0) { free(json_str); free(h2_buf); return -1; }
-    h2_pos += hdr_len;
-
-    int data_len = ml_h2_build_data_frame(h2_buf + h2_pos, json_len + 512 - h2_pos,
-                                            (uint8_t *)json_str, json_len,
-                                            5, true);
-    free(json_str);
-    if (data_len < 0) { free(h2_buf); return -1; }
-    h2_pos += data_len;
-
-    if (noise_send(ml, noise, h2_buf, h2_pos) < 0) {
-        free(h2_buf);
-        return -1;
-    }
-    free(h2_buf);
-
-    ESP_LOGI(TAG, "Streaming MapRequest sent on stream 5");
-    return 0;
-}
-
 /* Send a "lite" endpoint update to the control plane.
  * This is a non-streaming MapRequest (Stream=false, OmitPeers=true) that
  * only updates our endpoints and hostinfo. Required because Version >= 68
@@ -2207,8 +2102,8 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
              (int)json_len, ep_count);
 
     /* Use incrementing odd stream IDs (H2 client-initiated = odd).
-     * Streams 1, 3, 5 are used by register, fetch peers, and long-poll.
-     * Start at 7, increment by 2 for each endpoint update.
+     * Stream 1 = /machine/register, stream 5 = long-poll (opened by do_fetch_peers).
+     * Stream 3 is unused. Endpoint updates start at 7, +2 per call.
      * Reset to 7 on reconnect (h2_next_stream_id initialized in connect). */
     if (ml->h2_next_stream_id < 7) ml->h2_next_stream_id = 7;
     uint32_t sid = ml->h2_next_stream_id;
@@ -2266,10 +2161,15 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
     int frame_len = noise_recv(ml, noise, frame_buf, 65536);
 
     if (frame_len <= 0) {
-        free(frame_buf);
         int saved_errno = errno;
         /* EAGAIN/EWOULDBLOCK = no data yet = not an error */
-        if (saved_errno == EAGAIN || saved_errno == EWOULDBLOCK) return 0;
+        if (saved_errno == EAGAIN || saved_errno == EWOULDBLOCK) {
+            free(frame_buf);
+            return 0;
+        }
+        ESP_LOGW(TAG, "[DIAG] poll_map_update: noise_recv=%d errno=%d (select said sel=%d)",
+                 frame_len, saved_errno, sel);
+        free(frame_buf);
         return frame_len;  /* Real error or connection closed */
     }
 
@@ -2289,6 +2189,25 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
         pos += 9;
 
         if (pos + (int)f_len > frame_len) break;
+
+        ESP_LOGD(TAG, "[DIAG] H2 frame: type=0x%02x flags=0x%02x len=%lu stream=%lu",
+                 f_type, f_flags, (unsigned long)f_len, (unsigned long)f_stream);
+
+        if (f_type == 0x07) {  /* GOAWAY */
+            ESP_LOGW(TAG, "[DIAG] GOAWAY received, last_stream_id=%lu",
+                     f_len >= 4 ? (unsigned long)(
+                         (frame_buf[pos] << 24) | (frame_buf[pos+1] << 16) |
+                         (frame_buf[pos+2] << 8) | frame_buf[pos+3]) : 0UL);
+        } else if (f_type == 0x03) {  /* RST_STREAM */
+            ESP_LOGW(TAG, "[DIAG] RST_STREAM on stream %lu, error_code=%lu",
+                     (unsigned long)f_stream,
+                     f_len >= 4 ? (unsigned long)(
+                         (frame_buf[pos] << 24) | (frame_buf[pos+1] << 16) |
+                         (frame_buf[pos+2] << 8) | frame_buf[pos+3]) : 0UL);
+        } else if (f_type == 0x00 && (f_flags & 0x01) && f_stream == 5) {
+            ESP_LOGW(TAG, "[DIAG] END_STREAM on long-poll stream 5, len=%lu",
+                     (unsigned long)f_len);
+        }
 
         if (f_type == 0x00) {  /* DATA frame */
             total_data_bytes += f_len;
@@ -2530,7 +2449,11 @@ void ml_coord_task(void *arg) {
             break;
 
         case COORD_FETCH_PEERS:
-            ESP_LOGI(TAG, "Fetching peers...");
+            ESP_LOGI(TAG, "Opening long-poll (initial MapRequest)...");
+            /* Sends Stream=true MapRequest on H2 stream 5, reads the first
+             * length-prefixed MapResponse chunk (full Node/DERPMap/peers),
+             * and leaves stream 5 open. Subsequent delta chunks are read by
+             * poll_map_update() in the COORD_LONG_POLL state below. */
             if (do_fetch_peers(ml, &noise) < 0) {
                 ESP_LOGW(TAG, "MapRequest failed, will retry");
                 ml_close_sock(ml->coord_sock);
@@ -2550,11 +2473,6 @@ void ml_coord_task(void *arg) {
                                     pdFALSE, pdTRUE, pdMS_TO_TICKS(15000));
             }
 
-            /* Start streaming long-poll for incremental updates */
-            if (do_start_long_poll(ml, &noise) < 0) {
-                ESP_LOGW(TAG, "Failed to start long-poll (non-fatal)");
-            }
-
             /* Send initial endpoint update if STUN already completed.
              * (STUN runs concurrently and may have results by now.) */
             if (ml->stun_public_ip != 0 || ml->stun_has_ipv6) {
@@ -2571,7 +2489,7 @@ void ml_coord_task(void *arg) {
                 ping_frame[7] = 0x00; ping_frame[8] = 0x00;
                 memset(ping_frame + 9, 0x42, 8);
                 noise_send(ml, &noise, ping_frame, sizeof(ping_frame));
-                ESP_LOGI(TAG, "Sent initial HTTP/2 PING after long-poll");
+                ESP_LOGI(TAG, "Sent initial HTTP/2 PING");
             }
 
             state = COORD_LONG_POLL;
@@ -2785,7 +2703,8 @@ void ml_coord_task(void *arg) {
                         last_h2_ping_ms = now;
                         last_activity_ms = now;
                     } else {
-                        ESP_LOGW(TAG, "H2 PING send failed, reconnecting");
+                        ESP_LOGW(TAG, "[DIAG] H2 PING send failed ret=%d errno=%d, reconnecting",
+                                 ping_ret, errno);
                         state = COORD_RECONNECTING;
                         break;
                     }
@@ -2796,7 +2715,10 @@ void ml_coord_task(void *arg) {
                 if (poll_ret > 0) {
                     last_activity_ms = now;  /* Reset watchdog */
                 } else if (poll_ret < 0) {
-                    ESP_LOGW(TAG, "Long-poll connection lost");
+                    uint64_t in_poll_ms = now - last_activity_ms;
+                    ESP_LOGW(TAG, "[DIAG] Long-poll connection lost poll_ret=%d, "
+                             "%llums since last activity", poll_ret,
+                             (unsigned long long)in_poll_ms);
                     state = COORD_RECONNECTING;
                     break;
                 }
