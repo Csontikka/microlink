@@ -309,19 +309,19 @@ static void dispatch_derp_frame(microlink_t *ml, uint8_t frame_type,
         break;
 
     case DERP_FRAME_KEEP_ALIVE:
-        ESP_LOGD(TAG, "DERP KeepAlive received");
+        ESP_LOGI(TAG, "DERP KeepAlive received");
         break;
 
     case DERP_FRAME_PING:
         /* Echo ping data back as PONG directly (single-threaded, safe to write) */
         if (payload && payload_len > 0) {
-            ESP_LOGD(TAG, "DERP PING received, sending PONG");
+            ESP_LOGI(TAG, "DERP PING received, sending PONG");
             derp_write_frame(ml, DERP_FRAME_PONG, payload, payload_len);
         }
         break;
 
     case DERP_FRAME_PONG:
-        ESP_LOGD(TAG, "DERP PONG received");
+        ESP_LOGI(TAG, "DERP PONG received");
         break;
 
     case DERP_FRAME_PEER_GONE:
@@ -333,7 +333,7 @@ static void dispatch_derp_frame(microlink_t *ml, uint8_t frame_type,
         break;
 
     default:
-        ESP_LOGD(TAG, "DERP frame type 0x%02x ignored (%d bytes)",
+        ESP_LOGI(TAG, "DERP frame type 0x%02x ignored (%d bytes)",
                  frame_type, (int)payload_len);
         break;
     }
@@ -499,7 +499,7 @@ void ml_derp_tx_task(void *arg) {
 
         /* Unconditional heartbeat - proves task is alive */
         if (loop_start - last_heartbeat_ms > 5000) {
-            ESP_LOGW(TAG, "HEARTBEAT: loop=%lu conn=%d rx=%lu tx=%lu stack_free=%lu",
+            ESP_LOGI(TAG, "HEARTBEAT: loop=%lu conn=%d rx=%lu tx=%lu stack_free=%lu",
                      (unsigned long)loop_count, ml->derp.connected,
                      (unsigned long)frames_rx, (unsigned long)frames_tx,
                      (unsigned long)uxTaskGetStackHighWaterMark(NULL));
