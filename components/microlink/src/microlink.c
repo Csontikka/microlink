@@ -7,6 +7,9 @@
  */
 
 #include "microlink_internal.h"
+#include "wireguard.h"
+#include "wireguardif.h"
+#include "lwip/netif.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -620,6 +623,35 @@ esp_err_t microlink_get_peer_info(const microlink_t *ml, int index, microlink_pe
     info->online = p->active;
     info->direct_path = p->has_direct_path;
     return ESP_OK;
+}
+
+void microlink_force_derp_output(microlink_t *ml, bool force) {
+    if (!ml) return;
+    /* Store the intent unconditionally so that early callers (e.g. a
+     * wifi.on_connect hook flipping force_derp on a hotspot SSID BEFORE
+     * microlink_init has created the WG netif) don't get dropped.
+     * ml_wg_mgr_create_netif applies pending_force_derp_output once the
+     * netif exists, and is_force_derp_output reads this field, keeping
+     * intent and live state in agreement. */
+    ml->pending_force_derp_output = force;
+    if (!ml->wg_netif) {
+        ESP_LOGW(TAG, "force_derp_output=%d stored (WG netif not ready yet — will apply on init)",
+                 force ? 1 : 0);
+        return;
+    }
+    struct netif *netif = (struct netif *)ml->wg_netif;
+    wireguardif_force_derp_output(netif, force);
+    ESP_LOGW(TAG, "force_derp_output=%d (all outbound WG packets via DERP%s)",
+             force ? 1 : 0, force ? " — CGNAT fallback" : "");
+}
+
+bool microlink_is_force_derp_output(const microlink_t *ml) {
+    if (!ml) return false;
+    /* Return the stored intent rather than the live WG device flag.
+     * Before wg_netif exists, the intent is the only truth. After it does,
+     * pending_force_derp_output is kept in sync by every setter path (the
+     * public API here, and the re-apply in ml_wg_mgr_create_netif). */
+    return ml->pending_force_derp_output;
 }
 
 int64_t microlink_get_key_expiry(const microlink_t *ml) {

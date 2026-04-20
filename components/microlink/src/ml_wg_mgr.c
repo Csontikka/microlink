@@ -301,12 +301,21 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
         ESP_LOGI(TAG, "Cellular mode: at_socket_ready=%d, force_derp=%d", at_ready, at_ready);
         if (at_ready) {
             wireguardif_force_derp_output(netif, true);
+            ml->pending_force_derp_output = true;
             ESP_LOGI(TAG, "Cellular AT socket: forcing DERP output (direct UDP disabled)");
         } else {
             ESP_LOGI(TAG, "Cellular PPP mode: direct UDP ENABLED");
         }
     }
 #endif
+
+    /* Apply any pending_force_derp_output intent set *before* this netif
+     * existed (e.g. a wifi.on_connect hook preemptively flipping the flag on
+     * a hotspot SSID prior to microlink_init completing). */
+    if (ml->pending_force_derp_output) {
+        wireguardif_force_derp_output(netif, true);
+        ESP_LOGW(TAG, "force_derp_output=1 applied at WG netif creation (pending intent from pre-init)");
+    }
 
     ml->wg_netif = netif;
 

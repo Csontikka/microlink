@@ -174,6 +174,24 @@ int microlink_get_peer_count(const microlink_t *ml);
 esp_err_t microlink_get_peer_info(const microlink_t *ml, int index, microlink_peer_info_t *info);
 
 /**
+ * @brief Force all outbound WireGuard packets through the DERP relay callback
+ *
+ * When enabled, the WG netif skips any cached direct UDP endpoint and routes
+ * every outbound packet through the DERP TLS channel. Use this as a fallback
+ * when the device is behind a carrier-grade NAT (mobile hotspot, CGNAT) where
+ * direct UDP to a peer's public endpoint is silently dropped but DERP still
+ * works. Safe to call before microlink_init has built the WG netif — the
+ * intent is stored and applied at netif creation.
+ */
+void microlink_force_derp_output(microlink_t *ml, bool force);
+
+/**
+ * @brief Read the current force_derp_output flag
+ * @return true if all outbound WG packets are being routed via DERP
+ */
+bool microlink_is_force_derp_output(const microlink_t *ml);
+
+/**
  * @brief Get auth key / node key expiry time (Unix epoch seconds)
  * @param ml Handle
  * @return Expiry timestamp (Unix seconds), or 0 if unknown / no expiry set
