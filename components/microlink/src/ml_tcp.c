@@ -15,6 +15,7 @@
 #include "esp_timer.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
+#include <errno.h>
 #include <string.h>
 
 static const char *TAG = "ml_tcp";
@@ -152,12 +153,37 @@ microlink_tcp_socket_t *microlink_tcp_connect(microlink_t *ml, uint32_t dest_ip,
         int err = errno;
         ESP_LOGE(TAG, "connect() to %s:%u failed: errno=%d", ip_str, dest_port, err);
 
-        /* If tunnel wasn't ready, retry once after triggering handshake again */
-        if (err == EHOSTUNREACH || err == ENETUNREACH || err == ETIMEDOUT) {
+        /* If tunnel wasn't ready, retry once after triggering handshake again.
+         * ESP-IDF lwIP + wireguardif: a peer with no usable session often returns
+         * errno 113 from the connect path (see wireguardif_output_to_peer ERR_CONN) —
+         * that is not always equal to EHOSTUNREACH in newlib, so include 113 and
+         * ECONNABORTED explicitly. Without this branch, ml_tcp bails out immediately
+         * even though a second attempt after re-handshake succeeds. */
+        int retriable = (err == EHOSTUNREACH || err == ENETUNREACH || err == ETIMEDOUT);
+#ifdef ECONNABORTED
+        retriable = retriable || (err == ECONNABORTED);
+#endif
+        retriable = retriable || (err == 113);
+
+        if (retriable) {
             close(fd);
             ESP_LOGI(TAG, "Retrying after re-triggering WG handshake...");
             ml_wg_mgr_trigger_handshake(ml, dest_ip);
             ml_wg_mgr_send_cmm(ml, dest_ip);
+
+            /* CGNAT self-heal: errno=113 with a VALID keypair means the WG
+             * session is fine but the peer's cached direct UDP endpoint is
+             * unreachable from this network (typical on phone hotspots /
+             * carrier-grade NAT). Flip force_derp_output so WG output skips
+             * the dead direct UDP path and rides the DERP TLS tunnel instead.
+             * On home WiFi this branch is never taken (first connect wins),
+             * so direct UDP stays the fast path there. */
+            if (!microlink_is_force_derp_output(ml)) {
+                ESP_LOGW(TAG, "Enabling force_derp_output for WG outbound "
+                              "(CGNAT fallback; direct UDP to peer looks dead)");
+                microlink_force_derp_output(ml, true);
+            }
+
             vTaskDelay(pdMS_TO_TICKS(3000));
 
             fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);

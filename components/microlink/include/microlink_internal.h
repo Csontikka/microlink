@@ -434,6 +434,14 @@ struct microlink_s {
     uint32_t t_stun_interval_ms;
     uint32_t t_ctrl_watchdog_ms;
 
+    /* Sticky force_derp_output intent — set via microlink_force_derp_output()
+     * at any time (even before wg_netif exists). Applied to the live WG device
+     * immediately if wg_netif is ready, and re-applied in
+     * ml_wg_mgr_create_netif() once it becomes ready. This lets callers
+     * preemptively flip the flag on hotspot SSID detection before
+     * microlink_init() has built the WG interface. */
+    bool pending_force_derp_output;
+
     /* Callbacks */
     microlink_state_cb_t state_cb;
     void *state_cb_data;
