@@ -20,6 +20,13 @@
 
 static const char *TAG = "ml_tcp";
 
+/* ESP-IDF lwIP + wireguardif surfaces ERR_CONN (no usable WG session for the
+ * destination peer) as errno 113 from connect(). On some newlib builds this
+ * equals EHOSTUNREACH, on others it does not — so we match the literal value
+ * explicitly instead of relying on the alias. Keeping the magic number in one
+ * named place so the retriable-errno check below reads cleanly. */
+#define ML_ERRNO_WG_ERR_CONN 113
+
 /* ============================================================================
  * Internal Types
  * ========================================================================== */
@@ -154,16 +161,16 @@ microlink_tcp_socket_t *microlink_tcp_connect(microlink_t *ml, uint32_t dest_ip,
         ESP_LOGE(TAG, "connect() to %s:%u failed: errno=%d", ip_str, dest_port, err);
 
         /* If tunnel wasn't ready, retry once after triggering handshake again.
-         * ESP-IDF lwIP + wireguardif: a peer with no usable session often returns
-         * errno 113 from the connect path (see wireguardif_output_to_peer ERR_CONN) —
-         * that is not always equal to EHOSTUNREACH in newlib, so include 113 and
-         * ECONNABORTED explicitly. Without this branch, ml_tcp bails out immediately
-         * even though a second attempt after re-handshake succeeds. */
+         * wireguardif's ERR_CONN (peer with no usable session) surfaces as
+         * ML_ERRNO_WG_ERR_CONN, which is not always aliased to EHOSTUNREACH on
+         * newlib — include both explicitly plus ECONNABORTED. Without this branch
+         * ml_tcp would bail out immediately even though a second attempt after
+         * re-handshake succeeds. */
         int retriable = (err == EHOSTUNREACH || err == ENETUNREACH || err == ETIMEDOUT);
 #ifdef ECONNABORTED
         retriable = retriable || (err == ECONNABORTED);
 #endif
-        retriable = retriable || (err == 113);
+        retriable = retriable || (err == ML_ERRNO_WG_ERR_CONN);
 
         if (retriable) {
             close(fd);
@@ -171,9 +178,9 @@ microlink_tcp_socket_t *microlink_tcp_connect(microlink_t *ml, uint32_t dest_ip,
             ml_wg_mgr_trigger_handshake(ml, dest_ip);
             ml_wg_mgr_send_cmm(ml, dest_ip);
 
-            /* CGNAT self-heal: errno=113 with a VALID keypair means the WG
-             * session is fine but the peer's cached direct UDP endpoint is
-             * unreachable from this network (typical on phone hotspots /
+            /* CGNAT self-heal: ML_ERRNO_WG_ERR_CONN with a VALID keypair means
+             * the WG session is fine but the peer's cached direct UDP endpoint
+             * is unreachable from this network (typical on phone hotspots /
              * carrier-grade NAT). Flip force_derp_output so WG output skips
              * the dead direct UDP path and rides the DERP TLS tunnel instead.
              * On home WiFi this branch is never taken (first connect wins),
