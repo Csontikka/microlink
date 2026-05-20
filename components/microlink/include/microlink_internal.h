@@ -57,11 +57,7 @@ extern "C" {
 
 #define ML_TASK_WG_MGR_STACK    (8 * 1024)
 #define ML_TASK_WG_MGR_PRIO     7
-/* Pinned to CPU 0 (not 1) so the heavy crypto workload (x25519 in
- * wireguard_peer_init and wireguard_create_handshake_initiation, ~500ms each
- * on refc) does not starve ESPHome's loopTask on CPU 1. With 14 SaaS peers
- * back-to-back, leaving wg_mgr on CPU 1 tripped loopTask task_wdt. */
-#define ML_TASK_WG_MGR_CORE     0
+#define ML_TASK_WG_MGR_CORE     1
 
 /* Queue depths */
 #define ML_DERP_TX_QUEUE_DEPTH  16
@@ -78,8 +74,8 @@ extern "C" {
 #define ML_DERP_MAX_FRAME       (ML_MAX_PACKET_SIZE + 64)
 
 /* DERP */
-#define ML_DERP_REGION          9       /* Dallas (dfw) */
-#define ML_DERP_HOST            "derp9e.tailscale.com"
+#define ML_DERP_REGION          4       /* Frankfurt (fra) - closer to EU + matches typical peer home DERP */
+#define ML_DERP_HOST            "derp4.tailscale.com"
 #define ML_DERP_PORT            443
 
 /* Tailscale control plane */
@@ -235,6 +231,21 @@ typedef struct {
         bool is_ipv6;
     } endpoints[ML_MAX_ENDPOINTS];
     int endpoint_count;
+    bool is_exit_node;          /* Peer advertises 0.0.0.0/0 in AllowedIPs */
+    /* Subnet routes advertised by the peer (non-CGNAT, non-0.0.0.0/0). */
+    microlink_route_t subnet_routes[MICROLINK_MAX_PEER_ROUTES];
+    uint8_t subnet_route_count;
+    /* Tailscale netmap Node.Online tri-state. has_online=false means the
+     * MapResponse did not include this field and the current value should be
+     * preserved. has_online=true → online holds the authoritative value from
+     * the control plane (true = peer is connected to tailnet, false = offline). */
+    bool has_online;
+    bool online;
+    /* Tailscale NodeID — int64 in the wire format. Stored so PeersChangedPatch
+     * deltas (which carry only NodeID, not Key) can be matched back to the
+     * peer slot. has_node_id distinguishes "not parsed" from "parsed as 0". */
+    bool has_node_id;
+    uint64_t node_id;
 } ml_peer_update_t;
 
 /* ============================================================================
@@ -246,11 +257,6 @@ typedef struct {
     uint32_t vpn_ip;
     uint8_t public_key[32];
     uint8_t disco_key[32];
-    /* Precomputed NaCl box shared key (x25519 DH of disco_key × our disco_private_key).
-     * Computed once in add_peer() so each DISCO packet only costs Salsa20+Poly1305
-     * instead of a full x25519 scalar-mult (~500ms on ESP32-S3 refc). */
-    uint8_t disco_shared_key[32];
-    bool has_disco_shared_key;
     char hostname[64];
     bool active;
 
@@ -280,6 +286,32 @@ typedef struct {
 
     /* On-demand handshake: tried once on first DISCO direct path discovery */
     bool tried_initial_handshake;
+
+    /* DERP-only fallback (Phase 1.5g): for peers where direct UDP is impossible
+     * (e.g. both ends behind the same NAT with no hairpin, or VLAN-isolated). */
+    uint64_t peer_added_ms;        /* When this peer entered our state */
+    bool derp_fallback_active;     /* Endpoint forced to DERP via update_endpoint(0) */
+    uint64_t last_derp_attempt_ms; /* Last wireguardif_connect_derp() retry, for periodic re-fire */
+
+    /* Exit-node advertisement (Phase 1.5e): true if this peer carries
+     * 0.0.0.0/0 in AllowedIPs (i.e. tailscale up --advertise-exit-node). */
+    bool is_exit_node;
+
+    /* Subnet routes the peer advertises (non-CGNAT, non-default-route).
+     * Parsed from AllowedIPs in the netmap and used by the project-side
+     * route hook to direct matching destinations into the tunnel. */
+    microlink_route_t subnet_routes[MICROLINK_MAX_PEER_ROUTES];
+    uint8_t subnet_route_count;
+
+    /* Tailnet liveness from the control plane's Node.Online flag (the same
+     * signal the official Tailscale UI uses). Defaults to true on peer
+     * insertion until the first MapResponse field clears it. */
+    bool online;
+
+    /* Tailscale NodeID — primary key for PeersChangedPatch deltas, which
+     * normally carry only NodeID (Key is only sent on key rotation). 0 means
+     * we have not seen an ID for this peer yet. */
+    uint64_t node_id;
 } ml_peer_t;
 
 /* ============================================================================
@@ -301,6 +333,7 @@ typedef struct {
 typedef struct {
     uint16_t region_id;
     char code[8];           /* e.g. "dfw", "nyc", "sfo" */
+    char name[24];          /* e.g. "Frankfurt", "New York" — from DERPMap RegionName */
     ml_derp_node_t nodes[ML_MAX_DERP_NODES];
     uint8_t node_count;
     bool avoid;             /* true if region should be avoided */
@@ -423,7 +456,16 @@ struct microlink_s {
     /* DERP map (parsed from MapResponse, owned by coord task) */
     ml_derp_region_t derp_regions[ML_MAX_DERP_REGIONS];
     uint8_t derp_region_count;
-    uint16_t derp_home_region;      /* Our PreferredDERP region */
+    uint16_t derp_home_region;     /* Currently active region (netcheck override may have replaced the default) */
+    uint16_t derp_region_default;  /* Configured default region — config.preferred_derp_region or ML_DERP_REGION fallback. The control plane itself does NOT send an independent suggestion; tailscale Go semantics. */
+
+    /* Most recent netcheck RTT measurements per derp_regions[] slot.
+     * Same index as derp_regions; 0 = no measurement / timed out. */
+    uint16_t derp_rtt_ms[ML_MAX_DERP_REGIONS];
+
+    /* ml_get_time_ms() value when state transitioned to CONNECTED. 0 means
+     * not currently connected. Used for the GUI tailnet uptime row. */
+    uint64_t connected_at_ms;
 
     /* Key expiry (parsed from MapResponse self-node) */
     int64_t key_expiry_epoch;       /* Unix epoch seconds, 0 = no expiry */
@@ -433,14 +475,6 @@ struct microlink_s {
     uint32_t t_disco_heartbeat_ms;
     uint32_t t_stun_interval_ms;
     uint32_t t_ctrl_watchdog_ms;
-
-    /* Sticky force_derp_output intent — set via microlink_force_derp_output()
-     * at any time (even before wg_netif exists). Applied to the live WG device
-     * immediately if wg_netif is ready, and re-applied in
-     * ml_wg_mgr_create_netif() once it becomes ready. This lets callers
-     * preemptively flip the flag on hotspot SSID detection before
-     * microlink_init() has built the WG interface. */
-    bool pending_force_derp_output;
 
     /* Callbacks */
     microlink_state_cb_t state_cb;
@@ -459,24 +493,14 @@ struct microlink_s {
     char nvs_device_name[48];
 
     /* Control plane host override (empty = use ML_CTRL_HOST default).
-     * Set from NVS at boot for Headscale/Ionscale/custom coordinators.
-     * May be a bare hostname, "host:port", or "http://host[:port]". */
+     * Set from NVS at boot for Headscale/Ionscale/custom coordinators,
+     * or from microlink_config_t.ctrl_host when supplied directly. */
     char ctrl_host[64];
 
-    /* Parsed host and port from ctrl_host (filled lazily by do_tcp_connect).
-     * ctrl_host_parsed is the bare hostname/IP, ctrl_port_str the port as
-     * decimal string (default "80"), ctrl_host_hdr is the value to use in
-     * HTTP "Host:" / HTTP/2 ":authority" (host, plus ":port" iff non-80). */
-    char ctrl_host_parsed[64];
-    char ctrl_port_str[8];
-    char ctrl_host_hdr[72];
-
-    /* Noise server static public key fetched from the custom control plane
-     * via GET /key?v=88. Valid only when ctrl_noise_pubkey_valid is true;
-     * otherwise ml_noise_init falls back to the hardcoded Tailscale SaaS
-     * server key. */
-    uint8_t ctrl_noise_pubkey[32];
-    bool ctrl_noise_pubkey_valid;
+    /* Subnet routes to advertise on register (Hostinfo.RoutableIPs).
+     * Newline-separated CIDR string copied from microlink_config_t.advertise_routes.
+     * Empty = no routes hirdetve. */
+    char advertise_routes[256];
 
     /* Debug flags (bitmask from NVS, checked at runtime for verbose logging) */
     uint8_t debug_flags;  /* bit 0: DISCO, bit 1: WG, bit 2: DERP, bit 3: coord */
@@ -509,13 +533,17 @@ void ml_wg_mgr_task(void *arg);
 void ml_wg_mgr_send_cmm(microlink_t *ml, uint32_t peer_vpn_ip);
 esp_err_t ml_wg_mgr_trigger_handshake(microlink_t *ml, uint32_t dest_vpn_ip);
 bool ml_wg_mgr_peer_is_up(microlink_t *ml, uint32_t vpn_ip);
-void ml_wg_mgr_update_transport(microlink_t *ml);
 
 /* ml_stun.c */
 esp_err_t ml_stun_resolve_servers(microlink_t *ml);
 esp_err_t ml_stun_send_probe(microlink_t *ml, const char *server, uint16_t port);
 esp_err_t ml_stun_send_probe_to(microlink_t *ml, uint32_t server_ip, uint16_t port);
 esp_err_t ml_stun_send_probe_ipv6(microlink_t *ml, const uint8_t *server_ip6, uint16_t port);
+
+/* DERP region latency probe. Pings every region (one node each) with
+ * a STUN binding request in parallel, measures RTT, returns the
+ * region_id with the lowest RTT. Returns 0 if nothing responded. */
+uint16_t ml_netcheck_pick_best_derp(microlink_t *ml);
 bool ml_stun_parse_response(const uint8_t *data, size_t len,
                              uint32_t *out_ip, uint16_t *out_port);
 bool ml_stun_parse_response_ipv6(const uint8_t *data, size_t len,

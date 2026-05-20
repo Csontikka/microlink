@@ -7,9 +7,6 @@
  */
 
 #include "microlink_internal.h"
-#include "wireguard.h"
-#include "wireguardif.h"
-#include "lwip/netif.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -21,7 +18,9 @@
 #include <string.h>
 #include <stdio.h>
 #include <fcntl.h>
+#include <time.h>
 #include "lwip/sockets.h"
+#include "wireguard-platform.h"
 
 #ifdef CONFIG_ML_ENABLE_CELLULAR
 #include "ml_cellular.h"
@@ -180,13 +179,11 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     if (ml->config.max_peers > ML_MAX_PEERS) ml->config.max_peers = ML_MAX_PEERS;
     ml->config.enable_derp = true;  /* Always need DERP for relay */
 
-    /* Honor caller-supplied custom control plane (Headscale etc.) immediately,
-     * so it takes priority over the NVS-sourced override applied below. */
-    if (config->ctrl_host && config->ctrl_host[0]) {
-        strncpy(ml->ctrl_host, config->ctrl_host, sizeof(ml->ctrl_host) - 1);
-        ml->ctrl_host[sizeof(ml->ctrl_host) - 1] = '\0';
-        ESP_LOGI(TAG, "Control plane from config: %s", ml->ctrl_host);
-    }
+    /* Seed derp_region_default from config so MapRequest.PreferredDERP and
+     * the GUI marker have a value before the first MapResponse arrives. */
+    ml->derp_region_default = ml->config.preferred_derp_region
+                              ? ml->config.preferred_derp_region
+                              : ML_DERP_REGION;
 
     ml->state = ML_STATE_IDLE;
     ml->coord_sock = -1;
@@ -213,6 +210,35 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     if (load_or_generate_keys(ml) != ESP_OK) {
         free(ml);
         return NULL;
+    }
+
+    /* Initialize the TAI64N timestamp base used by wireguard-lwip handshake
+     * inits. Peers reject any init timestamp <= the one we sent in our
+     * previous boot (replay-attack guard in the WireGuard spec). We persist
+     * a per-boot counter in NVS so this boot's base + uptime is always
+     * strictly greater than the previous boot's max-emitted timestamp.
+     * If real wall-clock has synced (SNTP), prefer that. */
+    {
+        uint64_t base_seconds = 0;
+        time_t wallclock = 0;
+        time(&wallclock);
+        if (wallclock > 1700000000) {
+            base_seconds = (uint64_t)wallclock;
+        } else {
+            nvs_handle_t h;
+            if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+                uint64_t prev = 0;
+                size_t sz = sizeof(prev);
+                nvs_get_blob(h, "wg_tai_base", &prev, &sz);
+                base_seconds = prev + 86400ULL; /* +1 day per boot */
+                nvs_set_blob(h, "wg_tai_base", &base_seconds, sizeof(base_seconds));
+                nvs_commit(h);
+                nvs_close(h);
+            }
+        }
+        wireguard_set_tai64n_base_seconds(base_seconds);
+        ESP_LOGI(TAG, "TAI64N base seconds set to %llu (wallclock=%lld)",
+                 (unsigned long long)base_seconds, (long long)wallclock);
     }
 
     /* Initialize peer NVS cache */
@@ -270,19 +296,33 @@ microlink_t *microlink_init(const microlink_config_t *config) {
             microlink_ip_to_str(nvs_pip, pip_str);
             ESP_LOGI(TAG, "Priority peer overridden from NVS: %s", pip_str);
         }
-        /* NVS ctrl_host is a fallback only — don't clobber a config-supplied value */
-        if (ml->ctrl_host[0] == '\0') {
-            const char *nvs_ctrl = ml_config_get_ctrl_host(ml->config_httpd);
-            if (nvs_ctrl) {
-                strncpy(ml->ctrl_host, nvs_ctrl, sizeof(ml->ctrl_host) - 1);
-                ml->ctrl_host[sizeof(ml->ctrl_host) - 1] = '\0';
-                ESP_LOGI(TAG, "Control plane overridden from NVS: %s", ml->ctrl_host);
-            }
+        const char *nvs_ctrl = ml_config_get_ctrl_host(ml->config_httpd);
+        if (nvs_ctrl) {
+            strncpy(ml->ctrl_host, nvs_ctrl, sizeof(ml->ctrl_host) - 1);
+            ESP_LOGI(TAG, "Control plane overridden from NVS: %s", ml->ctrl_host);
         }
         ml->debug_flags = ml_config_get_debug_flags(ml->config_httpd);
         if (ml->debug_flags) {
             ESP_LOGI(TAG, "Debug flags from NVS: 0x%02x", ml->debug_flags);
         }
+    }
+
+    /* Public-config plumbing for ctrl_host / advertise_routes — these mirror
+     * the NVS-override semantics above but apply even when the HTTP config
+     * server is disabled (CONFIG_ML_ENABLE_CONFIG_HTTPD=n). They give an
+     * embedding host (e.g. an integrating component) a way to drive the
+     * coordinator URL and subnet routes directly through microlink_config_t,
+     * without having to write to microlink's internal NVS namespace. */
+    if (ml->config.ctrl_host && ml->config.ctrl_host[0]) {
+        strncpy(ml->ctrl_host, ml->config.ctrl_host, sizeof(ml->ctrl_host) - 1);
+        ml->ctrl_host[sizeof(ml->ctrl_host) - 1] = '\0';
+        ESP_LOGI(TAG, "Control plane from config: %s", ml->ctrl_host);
+    }
+    if (ml->config.advertise_routes && ml->config.advertise_routes[0]) {
+        strncpy(ml->advertise_routes, ml->config.advertise_routes,
+                sizeof(ml->advertise_routes) - 1);
+        ml->advertise_routes[sizeof(ml->advertise_routes) - 1] = '\0';
+        ESP_LOGI(TAG, "Advertised routes from config: %s", ml->advertise_routes);
     }
 
     /* Create event group */
@@ -430,96 +470,6 @@ skip_bsd_socket:
     return ESP_OK;
 }
 
-esp_err_t microlink_rebind(microlink_t *ml) {
-    if (!ml) return ESP_ERR_INVALID_ARG;
-    if (ml->state == ML_STATE_IDLE) return ESP_ERR_INVALID_STATE;
-
-    ESP_LOGI(TAG, "=== Rebinding to new network interface ===");
-
-    /* Step 1: Invalidate socket FDs FIRST, then delay to let net_io_task's
-     * select() cycle complete (50ms timeout). Only THEN close the old FDs.
-     * Closing a socket while another thread has it in select() deadlocks
-     * on lwIP's global socket lock. */
-    int old_disco = ml->disco_sock4;
-    int old_stun = ml->stun_sock;
-    int old_stun6 = ml->stun_sock6;
-
-    /* Invalidate — net_io_task will skip these on next iteration */
-    ml->disco_sock4 = -1;
-    ml->stun_sock = -1;
-    ml->stun_sock6 = -1;
-
-    /* Wait for net_io_task select() to cycle out (50ms timeout + margin) */
-    vTaskDelay(pdMS_TO_TICKS(100));
-
-    /* Now safe to close the old FDs */
-    if (old_disco >= 0) ml_close_sock(old_disco);
-    if (old_stun >= 0) ml_close_sock(old_stun);
-    if (old_stun6 >= 0) ml_close_sock(old_stun6);
-    ESP_LOGI(TAG, "Rebind: closed DISCO + STUN sockets");
-
-    /* Step 2: Signal coord to reconnect. ML_CMD_FORCE_RECONNECT closes
-     * the coord socket, resets Noise state, and re-enters the
-     * STUN → DNS → TCP → Noise → Register → MapRequest flow.
-     * Peers and WG state are preserved. */
-    xEventGroupClearBits(ml->events, ML_EVT_COORD_REGISTERED);
-    ml_coord_cmd_t cmd = ML_CMD_FORCE_RECONNECT;
-    xQueueSend(ml->coord_cmd_queue, &cmd, pdMS_TO_TICKS(100));
-
-    /* Step 3: Signal DERP to reconnect. ML_EVT_DERP_RECONNECT triggers
-     * derp_tx_task to close TLS, then reconnect with full handshake.
-     * Pending TX packets are drained but WG state is preserved. */
-    xEventGroupClearBits(ml->events, ML_EVT_DERP_CONNECTED);
-    xEventGroupSetBits(ml->events, ML_EVT_DERP_RECONNECT);
-    ESP_LOGI(TAG, "Rebind: signaled coord + DERP to reconnect");
-
-    /* Step 4: Brief delay for coord/DERP to process reconnect signals */
-    vTaskDelay(pdMS_TO_TICKS(200));
-
-    /* Step 5: Recreate DISCO UDP socket on the new interface */
-#ifdef CONFIG_ML_ZERO_COPY_WG
-    ml_zerocopy_deinit(ml);
-    if (ml_zerocopy_init(ml) == ESP_OK) {
-        ESP_LOGI(TAG, "Rebind: zero-copy DISCO PCB recreated");
-        goto rebind_wg_update;
-    }
-    ESP_LOGW(TAG, "Rebind: zero-copy init failed, using BSD socket fallback");
-#endif
-    ml->disco_sock4 = ml_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (ml->disco_sock4 >= 0) {
-        struct sockaddr_in bind_addr = {
-            .sin_family = AF_INET,
-            .sin_port = htons(51820),
-            .sin_addr.s_addr = INADDR_ANY,
-        };
-        if (ml_bind(ml->disco_sock4, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
-            bind_addr.sin_port = 0;
-            ml_bind(ml->disco_sock4, (struct sockaddr *)&bind_addr, sizeof(bind_addr));
-        }
-        int tos = 0xB8;
-        setsockopt(ml->disco_sock4, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
-        int flags = ml_fcntl(ml->disco_sock4, F_GETFL, 0);
-        ml_fcntl(ml->disco_sock4, F_SETFL, flags | O_NONBLOCK);
-
-        struct sockaddr_in local_addr;
-        socklen_t addr_len = sizeof(local_addr);
-        getsockname(ml->disco_sock4, (struct sockaddr *)&local_addr, &addr_len);
-        ml->disco_local_port = ntohs(local_addr.sin_port);
-        ESP_LOGI(TAG, "Rebind: DISCO socket rebound to port %d", ml->disco_local_port);
-    } else {
-        ESP_LOGE(TAG, "Rebind: failed to create DISCO socket: errno=%d", errno);
-    }
-
-#ifdef CONFIG_ML_ZERO_COPY_WG
-rebind_wg_update:
-#endif
-    /* Step 6: Update WG output mode for new transport */
-    ml_wg_mgr_update_transport(ml);
-
-    ESP_LOGI(TAG, "=== Rebind complete — waiting for coord+DERP reconnect ===");
-    return ESP_OK;
-}
-
 esp_err_t microlink_stop(microlink_t *ml) {
     if (!ml) return ESP_ERR_INVALID_ARG;
 
@@ -620,46 +570,81 @@ esp_err_t microlink_get_peer_info(const microlink_t *ml, int index, microlink_pe
     info->vpn_ip = p->vpn_ip;
     strncpy(info->hostname, p->hostname, sizeof(info->hostname) - 1);
     memcpy(info->public_key, p->public_key, 32);
-    info->online = p->active;
+    /* Report Tailscale netmap liveness rather than the microlink slot-active
+     * flag — `p->active` only means "the peer occupies a slot", not that the
+     * remote device is currently reachable on the tailnet. */
+    info->online = p->online && p->active;
     info->direct_path = p->has_direct_path;
+    info->is_exit_node = p->is_exit_node;
+    info->subnet_route_count = p->subnet_route_count;
+    if (info->subnet_route_count > MICROLINK_MAX_PEER_ROUTES) {
+        info->subnet_route_count = MICROLINK_MAX_PEER_ROUTES;
+    }
+    for (int r = 0; r < info->subnet_route_count; r++) {
+        info->subnet_routes[r] = p->subnet_routes[r];
+    }
     return ESP_OK;
 }
 
-void microlink_force_derp_output(microlink_t *ml, bool force) {
-    if (!ml) return;
-    /* Store the intent unconditionally so that early callers (e.g. a
-     * wifi.on_connect hook flipping force_derp on a hotspot SSID BEFORE
-     * microlink_init has created the WG netif) don't get dropped.
-     * ml_wg_mgr_create_netif applies pending_force_derp_output once the
-     * netif exists, and is_force_derp_output reads this field, keeping
-     * intent and live state in agreement. */
-    ml->pending_force_derp_output = force;
-    if (!ml->wg_netif) {
-        ESP_LOGW(TAG, "force_derp_output=%d stored (WG netif not ready yet — will apply on init)",
-                 force ? 1 : 0);
-        return;
+esp_err_t microlink_get_diag(const microlink_t *ml, microlink_diag_t *out) {
+    if (!ml || !out) return ESP_ERR_INVALID_ARG;
+    memset(out, 0, sizeof(*out));
+    out->state = ml->state;
+    out->connected = (ml->state == ML_STATE_CONNECTED);
+    out->vpn_ip = ml->vpn_ip;
+    out->wan_public_ip = ml->stun_public_ip;
+    out->derp_home_region = ml->derp_home_region;
+    out->derp_region_default = ml->derp_region_default;
+    out->peer_count = ml->peer_count;
+    int online = 0;
+    for (int i = 0; i < ml->peer_count; i++) {
+        if (ml->peers[i].active && ml->peers[i].online) online++;
     }
-    struct netif *netif = (struct netif *)ml->wg_netif;
-    wireguardif_force_derp_output(netif, force);
-    ESP_LOGW(TAG, "force_derp_output=%d (all outbound WG packets via DERP%s)",
-             force ? 1 : 0, force ? " — CGNAT fallback" : "");
+    out->peer_online = online;
+    if (ml->state == ML_STATE_CONNECTED && ml->connected_at_ms > 0) {
+        uint64_t now_ms = ml_get_time_ms();
+        if (now_ms > ml->connected_at_ms) {
+            out->uptime_sec = (uint32_t)((now_ms - ml->connected_at_ms) / 1000ULL);
+        }
+    }
+    return ESP_OK;
 }
 
-bool microlink_is_force_derp_output(const microlink_t *ml) {
-    if (!ml) return false;
-    /* Return the stored intent rather than the live WG device flag.
-     * Before wg_netif exists, the intent is the only truth. After it does,
-     * pending_force_derp_output is kept in sync by every setter path (the
-     * public API here, and the re-apply in ml_wg_mgr_create_netif). */
-    return ml->pending_force_derp_output;
+const char *microlink_get_derp_region_name(const microlink_t *ml, uint16_t region_id) {
+    if (!ml || region_id == 0) return NULL;
+    for (int i = 0; i < ml->derp_region_count; i++) {
+        if (ml->derp_regions[i].region_id == region_id && ml->derp_regions[i].name[0]) {
+            return ml->derp_regions[i].name;
+        }
+    }
+    return NULL;
 }
 
-int64_t microlink_get_key_expiry(const microlink_t *ml) {
-    return ml ? ml->key_expiry_epoch : 0;
-}
-
-bool microlink_is_key_expired(const microlink_t *ml) {
-    return ml ? ml->key_expired : false;
+int microlink_get_derp_rtts(const microlink_t *ml, microlink_derp_rtt_t *out, int max) {
+    if (!ml || !out || max <= 0) return 0;
+    int count = 0;
+    for (int i = 0; i < ml->derp_region_count && count < max; i++) {
+        uint16_t rtt = ml->derp_rtt_ms[i];
+        uint16_t rid = ml->derp_regions[i].region_id;
+        if (rid == 0) continue;
+        out[count].region_id = rid;
+        out[count].rtt_ms = rtt;
+        count++;
+    }
+    /* Insertion sort by rtt_ms ascending; zero-RTT (timeout) goes to the end. */
+    for (int i = 1; i < count; i++) {
+        microlink_derp_rtt_t cur = out[i];
+        uint16_t cur_key = cur.rtt_ms ? cur.rtt_ms : 0xFFFF;
+        int j = i - 1;
+        while (j >= 0) {
+            uint16_t prev_key = out[j].rtt_ms ? out[j].rtt_ms : 0xFFFF;
+            if (prev_key <= cur_key) break;
+            out[j + 1] = out[j];
+            j--;
+        }
+        out[j + 1] = cur;
+    }
+    return count;
 }
 
 /* ============================================================================
