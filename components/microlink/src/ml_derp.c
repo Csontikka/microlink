@@ -309,19 +309,19 @@ static void dispatch_derp_frame(microlink_t *ml, uint8_t frame_type,
         break;
 
     case DERP_FRAME_KEEP_ALIVE:
-        ESP_LOGI(TAG, "DERP KeepAlive received");
+        ESP_LOGD(TAG, "DERP KeepAlive received");
         break;
 
     case DERP_FRAME_PING:
         /* Echo ping data back as PONG directly (single-threaded, safe to write) */
         if (payload && payload_len > 0) {
-            ESP_LOGI(TAG, "DERP PING received, sending PONG");
+            ESP_LOGD(TAG, "DERP PING received, sending PONG");
             derp_write_frame(ml, DERP_FRAME_PONG, payload, payload_len);
         }
         break;
 
     case DERP_FRAME_PONG:
-        ESP_LOGI(TAG, "DERP PONG received");
+        ESP_LOGD(TAG, "DERP PONG received");
         break;
 
     case DERP_FRAME_PEER_GONE:
@@ -333,7 +333,7 @@ static void dispatch_derp_frame(microlink_t *ml, uint8_t frame_type,
         break;
 
     default:
-        ESP_LOGI(TAG, "DERP frame type 0x%02x ignored (%d bytes)",
+        ESP_LOGD(TAG, "DERP frame type 0x%02x ignored (%d bytes)",
                  frame_type, (int)payload_len);
         break;
     }
@@ -497,7 +497,11 @@ void ml_derp_tx_task(void *arg) {
         loop_count++;
         uint64_t loop_start = ml_get_time_ms();
 
-        /* Unconditional heartbeat - proves task is alive */
+        /* Unconditional heartbeat - proves task is alive. Was ESP_LOGW so
+         * it would survive any default-log-level filter while debugging
+         * the DERP-stall issue; now downgraded to INFO since the /log
+         * ring + /tailscale diag panel cover that need and the W-spam
+         * was drowning real warnings. */
         if (loop_start - last_heartbeat_ms > 5000) {
             ESP_LOGI(TAG, "HEARTBEAT: loop=%lu conn=%d rx=%lu tx=%lu stack_free=%lu",
                      (unsigned long)loop_count, ml->derp.connected,
