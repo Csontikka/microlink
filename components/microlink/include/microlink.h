@@ -236,6 +236,14 @@ typedef struct {
      *   >0 = registered as a real user, name in register_user_name. */
     int      register_user_id;
     char     register_user_name[48];
+
+    /* True = every keypair loaded from NVS at boot, so the device has
+     * a stable node-key. False = at least one was freshly generated
+     * (factory-reset or first boot). The pubkey prefix is 16 hex chars
+     * of the WG public key — enough to identify the node visually in
+     * the Headscale node list without dumping the full key. */
+    bool     identity_persistent;
+    char     identity_pubkey_prefix[17];
 } microlink_diag_t;
 
 esp_err_t microlink_get_diag(const microlink_t *ml, microlink_diag_t *out);

@@ -60,6 +60,7 @@ static esp_err_t load_or_generate_keys(microlink_t *ml) {
         generate_keypair(ml->machine_private_key, ml->machine_public_key);
         generate_keypair(ml->wg_private_key, ml->wg_public_key);
         generate_keypair(ml->disco_private_key, ml->disco_public_key);
+        ml->identity_persistent = false;
         return ESP_OK;
     }
 
@@ -110,6 +111,10 @@ static esp_err_t load_or_generate_keys(microlink_t *ml) {
     } else {
         ESP_LOGI(TAG, "Keys loaded from NVS");
     }
+    /* All three keypairs survived = persistent identity. Surfaced to
+     * applications via microlink_diag_t so the UI can tell the operator
+     * whether the device is registered-but-stale vs genuinely fresh. */
+    ml->identity_persistent = !need_save;
 
     nvs_close(nvs);
     return ESP_OK;
@@ -612,6 +617,14 @@ esp_err_t microlink_get_diag(const microlink_t *ml, microlink_diag_t *out) {
     out->register_user_id = ml->register_user_id;
     strlcpy(out->register_user_name, ml->register_user_name,
             sizeof out->register_user_name);
+    out->identity_persistent = ml->identity_persistent;
+    /* First 16 hex chars of the WG public key (= 8 bytes). Enough to
+     * eyeball-match against `headscale nodes list` output. */
+    for (int i = 0; i < 8; i++) {
+        snprintf(out->identity_pubkey_prefix + i * 2, 3,
+                 "%02x", ml->wg_public_key[i]);
+    }
+    out->identity_pubkey_prefix[16] = '\0';
     return ESP_OK;
 }
 

@@ -384,6 +384,13 @@ struct microlink_s {
     volatile microlink_state_t state;
     volatile uint32_t vpn_ip;
 
+    /* True when load_or_generate_keys() found every keypair in NVS at
+     * boot (i.e. this device has a persistent node identity). False
+     * when at least one keypair had to be freshly generated — the
+     * common case is a never-registered board or one that just went
+     * through microlink_factory_reset. */
+    bool identity_persistent;
+
     /* Last RegisterResponse User block. Headscale returns User.ID=0 and
      * an empty DisplayName when the supplied auth_key didn't resolve to
      * a real user — or when the node-key was registered before but the
