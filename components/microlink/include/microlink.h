@@ -229,6 +229,13 @@ typedef struct {
     int      peer_count;
     int      peer_online;       /* peers currently marked active */
     uint32_t uptime_sec;        /* seconds in ML_STATE_CONNECTED; 0 if not connected */
+    /* Last RegisterResponse User block — surfaces auth_key / stale-
+     * node-key failures that Headscale wraps in a 200-OK. Semantics:
+     *   -1 = no RegisterResponse parsed yet this boot,
+     *    0 = identity is bad (auth_key invalid or node-key unknown),
+     *   >0 = registered as a real user, name in register_user_name. */
+    int      register_user_id;
+    char     register_user_name[48];
 } microlink_diag_t;
 
 esp_err_t microlink_get_diag(const microlink_t *ml, microlink_diag_t *out);

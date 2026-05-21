@@ -384,6 +384,20 @@ struct microlink_s {
     volatile microlink_state_t state;
     volatile uint32_t vpn_ip;
 
+    /* Last RegisterResponse User block. Headscale returns User.ID=0 and
+     * an empty DisplayName when the supplied auth_key didn't resolve to
+     * a real user — or when the node-key was registered before but the
+     * server-side record is gone. The Register call itself returns 200
+     * in that case, so without surfacing this here the only symptom is
+     * a confusing "node not found" on the next MapRequest.
+     *
+     * register_user_id semantics:
+     *   -1 = no RegisterResponse parsed yet this boot
+     *    0 = auth/identity is bad (the failure mode)
+     *   >0 = a real user; register_user_name holds the DisplayName */
+    int  register_user_id;
+    char register_user_name[48];
+
     /* Event group (cross-task synchronization) */
     EventGroupHandle_t events;
 

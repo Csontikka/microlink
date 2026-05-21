@@ -979,6 +979,43 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     parse_start[parse_len] = saved;
     free(resp_buf);
 
+    /* Sanity-check the User block before anything else. Headscale will
+     * still 200 the Register call when the auth_key is bogus or the
+     * node-key was previously registered but the server-side record is
+     * gone — only the JSON betrays the truth (User.ID=0, empty
+     * DisplayName). Without surfacing it here, the first user-visible
+     * symptom is a "node not found" from the next MapRequest, which
+     * reads like a generic transport problem. */
+    {
+        cJSON *user = cJSON_GetObjectItem(resp_json, "User");
+        int   id_val   = -1;
+        const char *name_val = "";
+        if (user) {
+            cJSON *id_j   = cJSON_GetObjectItem(user, "ID");
+            cJSON *name_j = cJSON_GetObjectItem(user, "DisplayName");
+            if (id_j   && cJSON_IsNumber(id_j))   id_val   = id_j->valueint;
+            if (name_j && cJSON_IsString(name_j)) name_val = name_j->valuestring;
+        }
+        ml->register_user_id = id_val;
+        strlcpy(ml->register_user_name, name_val ? name_val : "",
+                sizeof ml->register_user_name);
+        if (id_val == 0 && (!name_val || !*name_val)) {
+            ESP_LOGE(TAG,
+                "RegisterResponse User.ID=0 + DisplayName=\"\" — the "
+                "control plane accepted the connect but didn't bind us "
+                "to a real user.");
+            ESP_LOGE(TAG,
+                "  Most likely: the auth_key is invalid/expired, or the "
+                "node-key was previously registered and then deleted on "
+                "the server. Fix: regenerate the device identity "
+                "(microlink_factory_reset + reboot) or supply a fresh "
+                "auth_key + reauthorize the node on the control plane.");
+        } else if (id_val > 0) {
+            ESP_LOGI(TAG, "Registered as User.ID=%d \"%s\"",
+                     id_val, name_val ? name_val : "");
+        }
+    }
+
     /* Extract our VPN IP from Node.Addresses */
     cJSON *node = cJSON_GetObjectItem(resp_json, "Node");
     if (node) {

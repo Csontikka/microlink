@@ -186,6 +186,8 @@ microlink_t *microlink_init(const microlink_config_t *config) {
                               : ML_DERP_REGION;
 
     ml->state = ML_STATE_IDLE;
+    ml->register_user_id = -1;        /* "no RegisterResponse yet" */
+    ml->register_user_name[0] = '\0';
     ml->coord_sock = -1;
     ml->disco_sock4 = -1;
     ml->disco_sock6 = -1;
@@ -607,6 +609,9 @@ esp_err_t microlink_get_diag(const microlink_t *ml, microlink_diag_t *out) {
             out->uptime_sec = (uint32_t)((now_ms - ml->connected_at_ms) / 1000ULL);
         }
     }
+    out->register_user_id = ml->register_user_id;
+    strlcpy(out->register_user_name, ml->register_user_name,
+            sizeof out->register_user_name);
     return ESP_OK;
 }
 
