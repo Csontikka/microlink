@@ -1107,33 +1107,34 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
                              (int)((pkt->src_ip >> 24) & 0xFF), (int)((pkt->src_ip >> 16) & 0xFF),
                              (int)((pkt->src_ip >> 8) & 0xFF), (int)(pkt->src_ip & 0xFF),
                              (int)pkt->src_port, p->hostname);
-                    /* First direct path discovery — send a one-shot handshake
-                     * via direct UDP. Do NOT use wireguardif_connect() which
-                     * sets peer->active=true and causes infinite handshake
-                     * retries (every 5s) when the peer has us trimmed.
-                     * Instead, just fire a single handshake init. If the peer
-                     * has us configured, it will respond and establish session.
-                     * If not, we stop and wait for them to initiate. */
-                    if (!p->tried_initial_handshake) {
-                        p->tried_initial_handshake = true;
-                        /* Store endpoint so wireguardif_connect sends to it */
+                    /* Direct-path discovered but no WG session yet. Fire a one-shot
+                     * handshake init via direct UDP, but rate-limit so a dropped or
+                     * unanswered init gets another try every INITIAL_HANDSHAKE_RETRY_MS.
+                     * The original implementation set a single boolean and gave up —
+                     * any peer whose first init was lost stayed forever without a
+                     * session even though subsequent direct PONGs kept arriving.
+                     * We still clear peer->active right after wireguardif_connect()
+                     * so the WG layer doesn't busy-loop retries at 5 s; the retry
+                     * cadence comes from this DISCO PONG handler instead. */
+                    #define INITIAL_HANDSHAKE_RETRY_MS 30000ULL
+                    bool first_try = (p->last_init_handshake_ms == 0);
+                    bool retry_due = !first_try &&
+                                     (now - p->last_init_handshake_ms > INITIAL_HANDSHAKE_RETRY_MS);
+                    if (first_try || retry_due) {
+                        p->last_init_handshake_ms = now;
                         wireguardif_update_endpoint(netif, (u8_t)p->wg_peer_index,
                                                      &ep_ip, pkt->src_port);
-                        /* Fire one handshake init but don't leave peer active.
-                         * wireguardif_connect sets active=true internally, so
-                         * we immediately clear it after to prevent retries. */
                         wireguardif_connect(netif, (u8_t)p->wg_peer_index);
-                        /* Clear active to prevent infinite retry loop.
-                         * If handshake succeeds, the response handler will
-                         * establish the session regardless of active flag. */
                         {
                             struct wireguard_device *dev = (struct wireguard_device *)netif->state;
                             if (dev && p->wg_peer_index < WIREGUARD_MAX_PEERS) {
                                 dev->peers[p->wg_peer_index].active = false;
                             }
                         }
-                        ESP_LOGI(TAG, "WG one-shot handshake to %s (first direct path)", p->hostname);
+                        ESP_LOGI(TAG, "WG direct handshake %s to %s",
+                                 first_try ? "init" : "retry", p->hostname);
                     }
+                    #undef INITIAL_HANDSHAKE_RETRY_MS
                 }
             }
         }

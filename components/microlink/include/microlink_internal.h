@@ -284,8 +284,13 @@ typedef struct {
     /* WireGuard peer index in wireguard-lwip */
     int wg_peer_index;
 
-    /* On-demand handshake: tried once on first DISCO direct path discovery */
-    bool tried_initial_handshake;
+    /* On-demand handshake retry timestamp. When a direct DISCO PONG arrives
+     * for a peer without an active WG session, we fire a one-shot handshake
+     * init. The original implementation set a single boolean and never tried
+     * again — a lost or unanswered init left the session forever down.
+     * Now: record ml_get_time_ms() of the last attempt and re-fire after
+     * INITIAL_HANDSHAKE_RETRY_MS so dropped initiations get a second chance. */
+    uint64_t last_init_handshake_ms;
 
     /* DERP-only fallback (Phase 1.5g): for peers where direct UDP is impossible
      * (e.g. both ends behind the same NAT with no hairpin, or VLAN-isolated). */
