@@ -86,7 +86,14 @@ extern "C" {
 /* DISCO timing (from tailscaled - MUST match for correct behavior) */
 #define ML_DISCO_PING_INTERVAL_MS       5000
 #define ML_DISCO_HEARTBEAT_MS           3000
-#define ML_DISCO_TRUST_DURATION_MS      15000
+/* Bumped 15000 → 60000 (2026-05-24): under sustained AP+STA radio contention
+ * (phone speedtest etc.), DISCO PINGs starve before the encrypted data path
+ * does. 15 s of PING silence was enough to falsely trigger "direct path
+ * expired → revert to DERP" on every active peer simultaneously, which
+ * zeroed working endpoints and crashed throughput. 60 s gives 20 PINGs worth
+ * of trust before we even consider falling back, and the smart-fallback
+ * gate in disco_periodic_probes adds a second check on peer->last_rx. */
+#define ML_DISCO_TRUST_DURATION_MS      60000
 #define ML_DISCO_PING_TIMEOUT_MS        5000
 #define ML_DISCO_UPGRADE_INTERVAL_MS    15000
 #define ML_DISCO_SESSION_ACTIVE_MS      45000

@@ -17,6 +17,8 @@
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_netif.h"
+#include "esp_system.h"
+#include "esp_heap_caps.h"
 #include "lwip/sockets.h"
 #include "lwip/netif.h"
 #include "lwip/pbuf.h"
@@ -221,6 +223,26 @@ esp_err_t microlink_pin_wg_output_netif(microlink_t *ml, struct netif *upstream)
     if (!s_wg_output_pcb) return ESP_ERR_INVALID_STATE;
     tcpip_callback_with_block(pin_wg_output_cb, (void *)upstream, 1);
     return ESP_OK;
+}
+
+/* SPIRAM-backed custom pbuf used by wg_udp_output_cb. The wrapper struct
+ * itself stays on INTERNAL heap (tiny — ~32 B) because lwIP and the WiFi
+ * driver may touch pbuf metadata from contexts where SPIRAM access is
+ * unsafe (cache-disable windows during SPI flash writes). Only the bulk
+ * data payload lives in SPIRAM — that buffer is only read by the WiFi
+ * driver's TX path, which already handles SPIRAM→internal-DMA copy
+ * transparently. */
+typedef struct {
+    struct pbuf_custom pc;
+    void *data_spiram;
+} ml_spiram_pbuf_t;
+
+static void ml_spiram_pbuf_free_fn(struct pbuf *p) {
+    /* pbuf_custom.pbuf == p; ml_spiram_pbuf_t starts at pc which is the
+     * same address. Free the SPIRAM payload first, then the wrapper. */
+    ml_spiram_pbuf_t *wrap = (ml_spiram_pbuf_t *)p;
+    heap_caps_free(wrap->data_spiram);
+    heap_caps_free(wrap);
 }
 
 static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
@@ -1096,11 +1118,53 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
                     uint32_t cur_ip_u32 = ip4_addr_get_u32(ip_2_ip4(&cur_ip));
                     uint32_t new_ip_u32 = htonl(pkt->src_ip);
                     if (cur_ip_u32 != new_ip_u32 || cur_port != pkt->src_port) {
-                        wireguardif_connect(netif, (u8_t)p->wg_peer_index);
-                        ESP_LOGI(TAG, "WG endpoint SWITCHED to direct: %d.%d.%d.%d:%d for %s",
-                                 (int)((pkt->src_ip >> 24) & 0xFF), (int)((pkt->src_ip >> 16) & 0xFF),
-                                 (int)((pkt->src_ip >> 8) & 0xFF), (int)(pkt->src_ip & 0xFF),
-                                 (int)pkt->src_port, p->hostname);
+                        /* Throughput-collapse fix (2026-05-24): peers behind
+                         * carrier-grade NAT (here: dk-tailscale-lxc, observed
+                         * port flipping every 30-60 s between :41641 and
+                         * :41642) generate continuous endpoint-changed PONGs.
+                         * The old code unconditionally re-handshaked on every
+                         * flip — each handshake stalls TX ~5-15 s, which is
+                         * what the user sees as "speedtest collapses to
+                         * 0.07 Mbps".
+                         *
+                         * wireguardif_update_endpoint() above already updated
+                         * peer->ip:port — the next TX packet goes to the new
+                         * endpoint with the EXISTING valid keypair. WireGuard
+                         * authenticates by key, not by endpoint, so the peer
+                         * still decrypts our packets correctly.
+                         *
+                         * Only force a fresh handshake when the encrypted
+                         * data path is ALSO stale (no RX in 5+ s) — at that
+                         * point the keypair may genuinely be out of sync. */
+                        struct wireguard_device *dev = (struct wireguard_device *)netif->state;
+                        uint32_t last_rx_age_ms = 0xFFFFFFFF;
+                        if (dev && p->wg_peer_index < WIREGUARD_MAX_PEERS) {
+                            struct wireguard_peer *wp = &dev->peers[p->wg_peer_index];
+                            if (wp->last_rx) {
+                                uint32_t now_wg = wireguard_sys_now();
+                                uint32_t age = now_wg - wp->last_rx;
+                                last_rx_age_ms = (age > 0x7FFFFFFFu) ? 0 : age;
+                            }
+                        }
+                        bool data_alive = (last_rx_age_ms < 5000);
+                        if (data_alive) {
+                            ESP_LOGI(TAG, "WG endpoint port flip (NAT-rebind) for %s "
+                                          "%d.%d.%d.%d:%d -> :%d; data alive "
+                                          "(last_rx=%ums), reusing keypair (no handshake)",
+                                     p->hostname,
+                                     (int)((cur_ip_u32 >> 0) & 0xFF), (int)((cur_ip_u32 >> 8) & 0xFF),
+                                     (int)((cur_ip_u32 >> 16) & 0xFF), (int)((cur_ip_u32 >> 24) & 0xFF),
+                                     (int)cur_port, (int)pkt->src_port,
+                                     (unsigned)last_rx_age_ms);
+                        } else {
+                            wireguardif_connect(netif, (u8_t)p->wg_peer_index);
+                            ESP_LOGI(TAG, "WG endpoint SWITCHED to direct: %d.%d.%d.%d:%d for %s "
+                                          "(last_rx=%ums, forcing handshake)",
+                                     (int)((pkt->src_ip >> 24) & 0xFF), (int)((pkt->src_ip >> 16) & 0xFF),
+                                     (int)((pkt->src_ip >> 8) & 0xFF), (int)(pkt->src_ip & 0xFF),
+                                     (int)pkt->src_port, p->hostname,
+                                     (unsigned)last_rx_age_ms);
+                        }
                     }
                 } else {
                     ESP_LOGI(TAG, "WG endpoint stored (no session): %d.%d.%d.%d:%d for %s",
@@ -1559,28 +1623,85 @@ static void disco_periodic_probes(microlink_t *ml) {
         bool peer_allowed = ml_config_peer_is_allowed(
             ml->config_httpd, p->vpn_ip);
 
-        /* Check if direct path trust has expired (always runs, not throttled) */
+        /* Check if direct path trust has expired (always runs, not throttled).
+         *
+         * Throughput-collapse fix (2026-05-24): the old code unconditionally
+         * called wireguardif_connect_derp() on trust-expiry, which ZEROES
+         * peer->ip:port. Under heavy AP+STA radio contention (phone
+         * speedtest), DISCO PINGs starve much sooner than the encrypted
+         * WG data path. All 3-4 active peers' direct paths "expired" at
+         * the same time even though encrypted data was still flowing on
+         * the direct UDP endpoint. They were all forced onto the single
+         * shared DERP TCP socket, whose send queue immediately overflowed
+         * (ERR_WOULDBLOCK), and the speedtest TCP collapsed and stayed
+         * collapsed because the back-off never recovered.
+         *
+         * New policy:
+         *   1. Read peer->last_rx from the WG layer to see if encrypted
+         *      data is still flowing on the direct endpoint.
+         *   2. If data IS flowing (last_rx < 30 s old), KEEP the direct
+         *      endpoint intact — only clear has_direct_path so the upgrade
+         *      probe re-fires, and burst 3 DISCO PINGs to recover trust.
+         *   3. If data is ALSO stale, then the path really is dead and the
+         *      old behaviour (zero endpoint + DERP handshake) is correct.
+         */
         if (p->has_direct_path && now > p->trust_until_ms) {
-            ESP_LOGI(TAG, "Direct path to %s expired, reverting to DERP", p->hostname);
-            p->has_direct_path = false;
-
-            /* Only do DERP fallback + re-probe for allowed peers.
-             * Non-allowed peers just get their state cleaned above. */
-            if (peer_allowed) {
-                /* Re-initiate DERP handshake only if we have an active WG session. */
-                if (ml->wg_netif && p->wg_peer_index >= 0) {
-                    struct netif *netif = (struct netif *)ml->wg_netif;
-                    err_t is_up = wireguardif_peer_is_up(netif, (u8_t)p->wg_peer_index,
-                                                           NULL, NULL);
-                    if (is_up == ERR_OK) {
-                        wireguardif_connect_derp(netif, (u8_t)p->wg_peer_index);
-                        ESP_LOGI(TAG, "  WG session active, falling back to DERP for %s", p->hostname);
+            /* Look up WG-side last_rx age before deciding. */
+            uint32_t last_rx_age_ms = 0xFFFFFFFF;
+            if (ml->wg_netif && p->wg_peer_index >= 0 &&
+                p->wg_peer_index < WIREGUARD_MAX_PEERS) {
+                struct netif *netif = (struct netif *)ml->wg_netif;
+                struct wireguard_device *dev = (struct wireguard_device *)netif->state;
+                if (dev) {
+                    struct wireguard_peer *wp = &dev->peers[p->wg_peer_index];
+                    if (wp->last_rx) {
+                        uint32_t now_wg = wireguard_sys_now();
+                        uint32_t age = now_wg - wp->last_rx;
+                        /* Saturate against the unsigned wrap that fires
+                         * when last_rx is updated mid-read. */
+                        last_rx_age_ms = (age > 0x7FFFFFFFu) ? 0 : age;
                     }
                 }
+            }
 
-                /* Force-ping to try re-establishing direct path (WiFi only) */
-                if (!ml_at_socket_is_ready()) {
-                    disco_send_ping_to_peer(ml, i, true);
+            bool data_flowing = (last_rx_age_ms < 30000);
+
+            p->has_direct_path = false;
+
+            if (peer_allowed) {
+                if (data_flowing) {
+                    /* PINGs stale but data alive — KEEP the direct endpoint.
+                     * Don't call wireguardif_connect_derp(): zeroing peer->ip
+                     * here is the exact pessimisation that caused the
+                     * throughput collapse. Burst 3 PINGs to recover trust
+                     * faster than the 3 s heartbeat would. */
+                    ESP_LOGI(TAG, "Direct path PING-stale for %s but data flowing "
+                                  "(last_rx=%ums) - keeping endpoint, bursting 3 PINGs",
+                             p->hostname, (unsigned)last_rx_age_ms);
+                    if (!ml_at_socket_is_ready()) {
+                        for (int b = 0; b < 3; b++) {
+                            disco_send_ping_to_peer(ml, i, true);
+                        }
+                    }
+                } else {
+                    /* Encrypted data ALSO stopped — the direct path is really
+                     * dead. Fall back to DERP. */
+                    ESP_LOGI(TAG, "Direct path to %s expired (last_rx=%ums), "
+                                  "reverting to DERP", p->hostname,
+                             (unsigned)last_rx_age_ms);
+                    if (ml->wg_netif && p->wg_peer_index >= 0) {
+                        struct netif *netif = (struct netif *)ml->wg_netif;
+                        err_t is_up = wireguardif_peer_is_up(netif, (u8_t)p->wg_peer_index,
+                                                               NULL, NULL);
+                        if (is_up == ERR_OK) {
+                            wireguardif_connect_derp(netif, (u8_t)p->wg_peer_index);
+                            ESP_LOGI(TAG, "  WG session active, falling back to DERP for %s", p->hostname);
+                        }
+                    }
+                    /* One force-ping to try re-establishing direct path. */
+                    if (!ml_at_socket_is_ready()) {
+                        disco_send_ping_to_peer(ml, i, true);
+                    }
                 }
             }
         }
@@ -1656,6 +1777,91 @@ static void disco_periodic_probes(microlink_t *ml) {
 }
 
 /* ============================================================================
+ * Throughput-collapse diagnostics — periodic state snapshot
+ *
+ * Logged every 10 s while the wg_mgr loop runs. Captures the full per-peer
+ * WG session state plus the DISCO probe-pool depth so we can correlate the
+ * 2-minute throughput collapse against rekey events, keypair destruction,
+ * endpoint drift, and probe leakage.
+ *
+ * Output format is a single ESP_LOGW line per peer (greppable with [WG_SNAP])
+ * and one summary line ([WG_SNAP_SUM]). Keep field order stable across
+ * commits — the operator analyses logs by column position.
+ * ========================================================================== */
+static void dump_wg_state_snapshot(microlink_t *ml) {
+    if (!ml || !ml->wg_netif) return;
+    struct netif *netif = (struct netif *)ml->wg_netif;
+    struct wireguard_device *dev = (struct wireguard_device *)netif->state;
+    if (!dev) return;
+
+    uint64_t now_ms = ml_get_time_ms();
+    uint32_t now_wg = wireguard_sys_now();
+
+    int active_probes = 0;
+    uint64_t oldest_probe_age_ms = 0;
+    for (int i = 0; i < MAX_PENDING_PROBES; i++) {
+        if (!pending_probes[i].active) continue;
+        active_probes++;
+        uint64_t age = now_ms - pending_probes[i].sent_ms;
+        if (age > oldest_probe_age_ms) oldest_probe_age_ms = age;
+    }
+
+    int linkup_peers = 0;
+    for (int i = 0; i < ml->peer_count; i++) {
+        ml_peer_t *p = &ml->peers[i];
+        if (!p->active) continue;
+        int wgi = p->wg_peer_index;
+        if (wgi < 0 || wgi >= WIREGUARD_MAX_PEERS) continue;
+        struct wireguard_peer *wp = &dev->peers[wgi];
+
+        /* Saturate wrap-around: WG-side timestamps can be updated in the
+         * gap between our now_wg sample and the per-peer read, producing
+         * a subtraction that wraps to 4294967xxx ms. Anything > INT32_MAX
+         * is really "just happened". */
+        #define SAT_AGE(ts) ((ts) ? \
+            (((uint32_t)(now_wg - (ts)) > 0x7FFFFFFFu) ? 0 : (uint32_t)(now_wg - (ts))) \
+            : 0xFFFFFFFF)
+        uint32_t last_rx_age = SAT_AGE(wp->last_rx);
+        uint32_t last_tx_age = SAT_AGE(wp->last_tx);
+        uint32_t last_init_age = SAT_AGE(wp->last_initiation_tx);
+        uint32_t curr_age = wp->curr_keypair.valid ? SAT_AGE(wp->curr_keypair.keypair_millis) : 0xFFFFFFFF;
+        uint32_t prev_age = wp->prev_keypair.valid ? SAT_AGE(wp->prev_keypair.keypair_millis) : 0xFFFFFFFF;
+        #undef SAT_AGE
+
+        if (wp->curr_keypair.valid || wp->prev_keypair.valid) linkup_peers++;
+
+        uint32_t ep_ip_u32 = ip_addr_isany(&wp->ip) ? 0 : ip4_addr_get_u32(ip_2_ip4(&wp->ip));
+        uint64_t last_pong_age = p->last_pong_recv_ms ? (now_ms - p->last_pong_recv_ms) : 0;
+
+        ESP_LOGW(TAG,
+            "[WG_SNAP] %s wgi=%d ep=%u.%u.%u.%u:%u "
+            "curr=%c(age=%lums cnt=%lu) prev=%c(age=%lums) "
+            "lastrx=%lums lasttx=%lums lastinit=%lums "
+            "send_hs=%d hs_attempts=%u "
+            "direct=%d derp_fb=%d pong_age=%llums",
+            p->hostname, wgi,
+            (unsigned)((ep_ip_u32 >> 0) & 0xFF), (unsigned)((ep_ip_u32 >> 8) & 0xFF),
+            (unsigned)((ep_ip_u32 >> 16) & 0xFF), (unsigned)((ep_ip_u32 >> 24) & 0xFF),
+            (unsigned)wp->port,
+            wp->curr_keypair.valid ? 'Y' : 'N', (unsigned long)curr_age,
+            (unsigned long)wp->curr_keypair.sending_counter,
+            wp->prev_keypair.valid ? 'Y' : 'N', (unsigned long)prev_age,
+            (unsigned long)last_rx_age, (unsigned long)last_tx_age,
+            (unsigned long)last_init_age,
+            (int)wp->send_handshake, (unsigned)wp->handshake_attempts,
+            (int)p->has_direct_path, (int)p->derp_fallback_active,
+            (unsigned long long)last_pong_age);
+    }
+
+    ESP_LOGW(TAG,
+        "[WG_SNAP_SUM] peers=%d linkup=%d active_probes=%d oldest_probe_age=%llums "
+        "heap_internal_free=%u",
+        ml->peer_count, linkup_peers, active_probes,
+        (unsigned long long)oldest_probe_age_ms,
+        (unsigned)esp_get_free_internal_heap_size());
+}
+
+/* ============================================================================
  * WG Manager Task
  * ========================================================================== */
 
@@ -1699,6 +1905,7 @@ void ml_wg_mgr_task(void *arg) {
 
     uint64_t last_disco_probe_ms = 0;
     uint64_t last_wg_periodic_ms = 0;
+    uint64_t last_snapshot_ms = 0;
     bool derp_was_connected = false;
     bool stun_cmm_sent = false;  /* One-shot: send CMMs after first STUN result */
 
@@ -1783,7 +1990,12 @@ void ml_wg_mgr_task(void *arg) {
             wireguardif_periodic((struct netif *)ml->wg_netif);
             uint64_t dt = ml_get_time_ms() - t0;
             last_wg_periodic_ms = now;
-            ESP_LOGI(TAG, "wireguardif_periodic: %llu ms", (unsigned long long)dt);
+            /* Throughput-collapse diag: only log when actually slow (>30ms),
+             * routine fast ticks are noise. */
+            if (dt > 30) {
+                ESP_LOGW(TAG, "wireguardif_periodic SLOW: %llu ms",
+                         (unsigned long long)dt);
+            }
         }
 
         /* Periodic DISCO probes (every 1s check) */
@@ -1793,7 +2005,16 @@ void ml_wg_mgr_task(void *arg) {
             disco_periodic_probes(ml);
             uint64_t dt = ml_get_time_ms() - t0;
             last_disco_probe_ms = now;
-            ESP_LOGI(TAG, "disco_periodic_probes: %llu ms", (unsigned long long)dt);
+            if (dt > 30) {
+                ESP_LOGW(TAG, "disco_periodic_probes SLOW: %llu ms",
+                         (unsigned long long)dt);
+            }
+        }
+
+        /* Throughput-collapse diag: full state snapshot every 10 s. */
+        if (now - last_snapshot_ms >= 10000) {
+            dump_wg_state_snapshot(ml);
+            last_snapshot_ms = now;
         }
 
         /* Yield - 10ms loop rate for minimum packet processing latency.

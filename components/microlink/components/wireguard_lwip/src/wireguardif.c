@@ -46,6 +46,7 @@
 #include "wireguard.h"
 #include "crypto.h"
 #include "lwip_compat.h"
+#include "esp_heap_caps.h"
 
 #include <stdio.h>
 #include <stdbool.h>
@@ -150,63 +151,94 @@ static err_t wireguardif_peer_output(struct netif *netif, struct pbuf *q, struct
 	WG_DEBUG("[WG_OUT] peer_output: endpoint=%s:%u, tot_len=%u\n",
 	       ip_addr_isany(&peer->ip) ? "0.0.0.0" : ipaddr_ntoa(&peer->ip), peer->port, (unsigned)q->tot_len);
 
+	const char *path = "direct-udp";
+	err_t result;
+
+	/* Throughput-fix (2026-05-24): per-packet linearise buffer goes to
+	 * SPIRAM, not internal DRAM. The DERP/magicsock callbacks need a
+	 * contiguous byte array but lwIP's mem_malloc() always lands in
+	 * internal heap. Under sustained ~140 pps to a single peer, the
+	 * 1312-byte alloc/free churn drives internal heap fragmentation;
+	 * with WG + TCP buffers + DNS-relay + httpd already on internal
+	 * DRAM, the alloc fails (ERR_MEM, errno=-1) and the packet drops.
+	 * SPIRAM has 8 MB headroom; per-packet latency is ~10 us extra,
+	 * negligible vs the rest of the WG path. */
+	#define WG_OUT_ALLOC(sz)  heap_caps_malloc((sz), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+	#define WG_OUT_FREE(p)    heap_caps_free(p)
 
 	// Check if peer has a direct endpoint (non-zero IP and port)
 	// If not, use DERP relay callback if available.
 	// force_derp_output: cellular mode — always route through DERP.
 	if (ip_addr_isany(&peer->ip) || peer->port == 0 || device->force_derp_output) {
+		path = device->force_derp_output ? "DERP-forced" : "DERP";
 		WG_DEBUG("[WG_OUT] No direct endpoint or force_derp, checking DERP\n");
 
 		if (device->derp_output_fn) {
 			// Linearize pbuf chain into contiguous buffer for DERP callback
-			uint8_t *data = (uint8_t *)mem_malloc(q->tot_len);
+			uint8_t *data = (uint8_t *)WG_OUT_ALLOC(q->tot_len);
 			if (data) {
 				pbuf_copy_partial(q, data, q->tot_len, 0);
-				err_t result = device->derp_output_fn(peer->public_key, data, q->tot_len, device->derp_output_ctx);
-				mem_free(data);
-				return result;
+				result = device->derp_output_fn(peer->public_key, data, q->tot_len, device->derp_output_ctx);
+				WG_OUT_FREE(data);
+				goto done;
 			}
-			WG_DEBUG("[WG_OUT] DERP mem_malloc failed!\n");
-		
-			return ERR_MEM;
+			WG_DEBUG("[WG_OUT] DERP heap_caps_malloc(SPIRAM) failed!\n");
+			result = ERR_MEM;
+			goto done;
 		}
 		// No DERP callback and no direct endpoint - can't send
 		WG_DEBUG("[WG_OUT] No DERP callback, returning ERR_RTE\n");
-	
-		return ERR_RTE;
+		result = ERR_RTE;
+		goto done;
 	}
 
 	// In magicsock mode, use external UDP output callback
 	if (device->udp_output_fn) {
+		path = "magicsock";
 		WG_DEBUG("[WG_OUT] Using magicsock callback\n");
-	
+
 		// Linearize pbuf chain and send via callback
-		uint8_t *data = (uint8_t *)mem_malloc(q->tot_len);
+		uint8_t *data = (uint8_t *)WG_OUT_ALLOC(q->tot_len);
 		if (data) {
-			WG_DEBUG("[WG_OUT] mem_malloc OK, copying pbuf\n");
-		
+			WG_DEBUG("[WG_OUT] alloc OK, copying pbuf\n");
 			pbuf_copy_partial(q, data, q->tot_len, 0);
 			// Convert lwIP IP address to network byte order uint32_t
 			uint32_t dest_ip = ip4_addr_get_u32(ip_2_ip4(&peer->ip));
 			WG_DEBUG("[WG_OUT] Calling udp_output_fn, dest_ip=0x%08lx port=%u len=%u\n",
 			       (unsigned long)dest_ip, peer->port, (unsigned)q->tot_len);
-		
-			err_t result = device->udp_output_fn(dest_ip, peer->port, data, q->tot_len, device->udp_output_ctx);
+
+			result = device->udp_output_fn(dest_ip, peer->port, data, q->tot_len, device->udp_output_ctx);
 			WG_DEBUG("[WG_OUT] udp_output_fn returned %d\n", result);
-		
-			mem_free(data);
-			return result;
+			WG_OUT_FREE(data);
+			goto done;
 		}
-		WG_DEBUG("[WG_OUT] mem_malloc FAILED for magicsock!\n");
-	
-		return ERR_MEM;
+		WG_DEBUG("[WG_OUT] heap_caps_malloc(SPIRAM) FAILED for magicsock!\n");
+		result = ERR_MEM;
+		goto done;
 	}
+
+	#undef WG_OUT_ALLOC
+	#undef WG_OUT_FREE
 
 	WG_DEBUG("[WG_OUT] Using direct udp_sendto\n");
 
 	// Send to last known port, not the connect port
 	//TODO: Support DSCP and ECN - lwip requires this set on PCB globally, not per packet
-	return udp_sendto(device->udp_pcb, q, &peer->ip, peer->port);
+	result = udp_sendto(device->udp_pcb, q, &peer->ip, peer->port);
+
+done:
+	/* Throughput-collapse diag: log every send failure with path + endpoint.
+	 * Successes stay quiet to avoid log flood. */
+	if (result != ERR_OK) {
+		printf("[WG_OUT_FAIL] peer=%02x%02x%02x%02x path=%s ep=%s:%u "
+		       "len=%u err=%d\n",
+		       peer->public_key[0], peer->public_key[1],
+		       peer->public_key[2], peer->public_key[3],
+		       path,
+		       ip_addr_isany(&peer->ip) ? "0.0.0.0" : ipaddr_ntoa(&peer->ip),
+		       peer->port, (unsigned)(q ? q->tot_len : 0), (int)result);
+	}
+	return result;
 }
 
 static err_t wireguardif_device_output(struct wireguard_device *device, struct pbuf *q, const ip_addr_t *ipaddr, u16_t port) {
@@ -324,8 +356,23 @@ static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, con
 				// Check to see if we should rekey
 				if (keypair->sending_counter >= REKEY_AFTER_MESSAGES) {
 					peer->send_handshake = true;
+					printf("[WG_REKEY] peer=%02x%02x%02x%02x reason=counter "
+					       "counter=%lu ep=%s:%u\n",
+					       peer->public_key[0], peer->public_key[1],
+					       peer->public_key[2], peer->public_key[3],
+					       (unsigned long)keypair->sending_counter,
+					       ip_addr_isany(&peer->ip) ? "DERP" : ipaddr_ntoa(&peer->ip),
+					       peer->port);
 				} else if (keypair->initiator && wireguard_expired(keypair->keypair_millis, REKEY_AFTER_TIME)) {
 					peer->send_handshake = true;
+					printf("[WG_REKEY] peer=%02x%02x%02x%02x reason=initiator-timer "
+					       "age_ms=%lu counter=%lu ep=%s:%u\n",
+					       peer->public_key[0], peer->public_key[1],
+					       peer->public_key[2], peer->public_key[3],
+					       (unsigned long)(wireguard_sys_now() - keypair->keypair_millis),
+					       (unsigned long)keypair->sending_counter,
+					       ip_addr_isany(&peer->ip) ? "DERP" : ipaddr_ntoa(&peer->ip),
+					       peer->port);
 				}
 
 			} else {
@@ -568,18 +615,22 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 
 								// 5. If the plaintext packet has not been dropped, it is inserted into the receive queue of the wg0 interface.
 								if (dest_ok) {
-									// Hand off to the TCPIP thread via tcpip_input(). Calling ip_input()
-									// directly from the ml_wg_mgr task races the real TCPIP thread's
-									// ip_data.current_ip4_header thread-local, which icmp_input()
-									// dereferences — observed crash: icmp.c:95 NULL deref under load
-									// (Pi -> tailnet ping bursts). tcpip_input() queues the pbuf and
-									// the TCPIP thread processes it with current_ip4_header set
-									// correctly.
-									WG_DEBUG("[WG_RX_IP] Passing %u bytes to TCPIP queue\n", (unsigned)pbuf->tot_len);
-									if (tcpip_input(pbuf, device->netif) == ERR_OK) {
-										pbuf = NULL;  // owned by TCPIP queue
+									// Throughput-regression fix (2026-05-24): tcpip_input()
+									// queues to the TCPIP thread (queue alloc + context
+									// switch + sem post per packet), which on the WG RX
+									// hot path caps throughput around ~30 pps and was
+									// the reason post-migration throughput collapsed to
+									// 10-20 KB/s versus the pre-migration 1+ Mbps. The
+									// OLD repo's wireguardif.c (verified at 1 Mbps) used
+									// netif->input directly here. The NULL-deref under
+									// Pi-ping load is a separate ICMP issue; if it
+									// re-surfaces we'll guard ip_data.current_ip4_header
+									// inside icmp_input, not at this layer.
+									WG_DEBUG("[WG_RX_IP] Direct input %u bytes\n", (unsigned)pbuf->tot_len);
+									if (device->netif->input(pbuf, device->netif) == ERR_OK) {
+										pbuf = NULL;
 									} else {
-										WG_DEBUG("[WG_RX_IP] DROPPED: tcpip_input failed\n");
+										WG_DEBUG("[WG_RX_IP] DROPPED: input failed\n");
 									}
 								} else {
 									WG_DEBUG("[WG_RX_IP] DROPPED: dest_ok=false\n");
@@ -1160,6 +1211,18 @@ static bool should_destroy_current_keypair(struct wireguard_peer *peer) {
 			(peer->curr_keypair.sending_counter >= REJECT_AFTER_MESSAGES))
 		) {
 		result = true;
+		/* Throughput-collapse diag: this is the moment encrypted traffic
+		 * actually stops flowing for a peer. Log endpoint + reason. */
+		bool by_age = wireguard_expired(peer->curr_keypair.keypair_millis, REJECT_AFTER_TIME);
+		printf("[WG_DESTROY] peer=%02x%02x%02x%02x reason=%s "
+		       "age_ms=%lu counter=%lu ep=%s:%u\n",
+		       peer->public_key[0], peer->public_key[1],
+		       peer->public_key[2], peer->public_key[3],
+		       by_age ? "age" : "counter",
+		       (unsigned long)(wireguard_sys_now() - peer->curr_keypair.keypair_millis),
+		       (unsigned long)peer->curr_keypair.sending_counter,
+		       ip_addr_isany(&peer->ip) ? "DERP" : ipaddr_ntoa(&peer->ip),
+		       peer->port);
 	}
 	return result;
 }
@@ -1168,6 +1231,17 @@ static bool should_reset_peer(struct wireguard_peer *peer) {
 	bool result = false;
 	if (peer->curr_keypair.valid && (wireguard_expired(peer->curr_keypair.keypair_millis, REJECT_AFTER_TIME * 3))) {
 		result = true;
+		/* Throughput-collapse diag: peer reset wipes endpoint back to connect_ip
+		 * (often 0.0.0.0 for DERP-only peers). Catch this BEFORE the wipe. */
+		printf("[WG_RESET] peer=%02x%02x%02x%02x age_ms=%lu ep=%s:%u "
+		       "-> reverting to connect_ip=%s:%u\n",
+		       peer->public_key[0], peer->public_key[1],
+		       peer->public_key[2], peer->public_key[3],
+		       (unsigned long)(wireguard_sys_now() - peer->curr_keypair.keypair_millis),
+		       ip_addr_isany(&peer->ip) ? "DERP" : ipaddr_ntoa(&peer->ip),
+		       peer->port,
+		       ip_addr_isany(&peer->connect_ip) ? "DERP" : ipaddr_ntoa(&peer->connect_ip),
+		       peer->connect_port);
 	}
 	return result;
 }
