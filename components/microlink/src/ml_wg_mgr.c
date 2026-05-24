@@ -262,9 +262,45 @@ static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
     /* Use raw PCB to send — safe from any thread context */
     if (!s_wg_output_pcb) return ERR_CONN;
 
-    struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, len, PBUF_RAM);
-    if (!p) return ERR_MEM;
-    memcpy(p->payload, data, len);
+    /* Throughput-stability fix (2026-05-24, re-applied after the WiFi
+     * channel-mismatch fix uncovered this as the residual stutter
+     * source): the original `pbuf_alloc(PBUF_TRANSPORT, len, PBUF_RAM)`
+     * goes to lwIP's internal-DRAM pool. Under sustained ~140 pps to a
+     * single peer that pool fragments, and 1312-byte mem_malloc starts
+     * failing (-1 ERR_MEM) at ~5/sec, producing visible speedtest
+     * stuttering. Move the per-packet payload to SPIRAM via the
+     * standard pbuf_alloced_custom() pattern — we have 8 MB of SPIRAM
+     * idle and the ~10 us extra latency is invisible next to the WG
+     * crypto cost. Wrapper struct stays on INTERNAL heap (tiny, ~16 B)
+     * because lwIP/WiFi may touch pbuf metadata from contexts where
+     * SPIRAM access is unsafe (cache-disable windows). */
+    /* PBUF_TRANSPORT headroom so lwIP can prepend UDP+IP+Ether headers
+     * in-place into the SPIRAM buffer instead of allocating a new
+     * internal-DRAM pbuf for them per packet. lwIP positions the payload
+     * at `payload_mem + LWIP_MEM_ALIGN_SIZE(layer_offset)`, so the
+     * memcpy offset MUST match that exact computation (the earlier
+     * attempt used the raw layer value and shipped corrupted data
+     * because the aligned offset was 2 B off — fixed here by using the
+     * same LWIP_MEM_ALIGN_SIZE macro for both sides). */
+    const u16_t hdr_offset = (u16_t)LWIP_MEM_ALIGN_SIZE((u16_t)PBUF_TRANSPORT);
+    const u16_t total_len = (u16_t)(hdr_offset + len);
+    ml_spiram_pbuf_t *wrap = heap_caps_malloc(sizeof(*wrap),
+                                                MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!wrap) return ERR_MEM;
+    wrap->data_spiram = heap_caps_malloc(total_len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!wrap->data_spiram) {
+        heap_caps_free(wrap);
+        return ERR_MEM;
+    }
+    memcpy((uint8_t *)wrap->data_spiram + hdr_offset, data, len);
+    wrap->pc.custom_free_function = ml_spiram_pbuf_free_fn;
+    struct pbuf *p = pbuf_alloced_custom(PBUF_TRANSPORT, (u16_t)len, PBUF_REF,
+                                          &wrap->pc, wrap->data_spiram, total_len);
+    if (!p) {
+        heap_caps_free(wrap->data_spiram);
+        heap_caps_free(wrap);
+        return ERR_MEM;
+    }
 
     ip_addr_t dst;
     IP_SET_TYPE_VAL(dst, IPADDR_TYPE_V4);
@@ -1673,15 +1709,16 @@ static void disco_periodic_probes(microlink_t *ml) {
                     /* PINGs stale but data alive — KEEP the direct endpoint.
                      * Don't call wireguardif_connect_derp(): zeroing peer->ip
                      * here is the exact pessimisation that caused the
-                     * throughput collapse. Burst 3 PINGs to recover trust
-                     * faster than the 3 s heartbeat would. */
+                     * throughput collapse. Send ONE re-probe (the 3-burst
+                     * earlier version cost ~5 ms ChaCha20-Poly1305 per PING
+                     * and with 11 peers triggering at the same tick blocked
+                     * disco_periodic_probes for 280+ ms — that was the
+                     * remaining stutter source the operator was seeing). */
                     ESP_LOGI(TAG, "Direct path PING-stale for %s but data flowing "
-                                  "(last_rx=%ums) - keeping endpoint, bursting 3 PINGs",
+                                  "(last_rx=%ums) - keeping endpoint, single PING",
                              p->hostname, (unsigned)last_rx_age_ms);
                     if (!ml_at_socket_is_ready()) {
-                        for (int b = 0; b < 3; b++) {
-                            disco_send_ping_to_peer(ml, i, true);
-                        }
+                        disco_send_ping_to_peer(ml, i, true);
                     }
                 } else {
                     /* Encrypted data ALSO stopped — the direct path is really
