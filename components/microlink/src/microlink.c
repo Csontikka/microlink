@@ -483,6 +483,27 @@ esp_err_t microlink_stop(microlink_t *ml) {
     ESP_LOGI(TAG, "Stopping...");
     xEventGroupSetBits(ml->events, ML_EVT_SHUTDOWN_REQUEST);
 
+    /* Unblock any task parked in a blocking socket call so it can observe the
+     * shutdown bit and self-delete BEFORE microlink_destroy() frees ml below.
+     * Without this a derp_tx task mid-TLS-handshake (mbedtls_ssl_read on
+     * derp.sockfd) or the coord task in coord_recv stays blocked past the
+     * wait, and the free() races the still-running task → use-after-free
+     * panic in mbedtls (observed 2026-05-26: ml_derp_tx crash in
+     * ssl_parse_record_header on a WiFi-uplink bounce that re-triggered the
+     * connect/teardown path). shutdown() — not close() — wakes the recv
+     * without invalidating the fd, so each task still closes its own socket
+     * in its normal error path and there is no double-close / fd-reuse race. */
+    if (ml->derp.sockfd >= 0) shutdown(ml->derp.sockfd, SHUT_RDWR);
+    if (ml->coord_sock >= 0)  shutdown(ml->coord_sock,  SHUT_RDWR);
+    /* The coord task may be parked in its reconnect backoff (xQueueReceive on
+     * coord_cmd_queue, up to a multi-second timeout) rather than in recv. Poke
+     * the queue so it returns to the loop top and sees the shutdown bit
+     * instead of sleeping the backoff out while we delete the queue. */
+    if (ml->coord_cmd_queue) {
+        ml_coord_cmd_t stop_cmd = ML_CMD_DISCONNECT;
+        xQueueSend(ml->coord_cmd_queue, &stop_cmd, 0);
+    }
+
     /* Wait for tasks to exit (they check ML_EVT_SHUTDOWN_REQUEST).
      * Tasks call vTaskDelete(NULL) to self-delete, so we must NOT call
      * vTaskDelete() on them again — that causes a crash in uxListRemove
