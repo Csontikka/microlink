@@ -500,6 +500,14 @@ struct microlink_s {
      * not currently connected. Used for the GUI tailnet uptime row. */
     uint64_t connected_at_ms;
 
+    /* ml_get_time_ms() captured at the top of the DERP I/O task's most
+     * recent loop iteration. A frozen value means that task is wedged in
+     * a socket call — external diagnostics watch the climbing age to catch
+     * the silent control-plane stall. Written every loop by the DERP task,
+     * read cross-task (volatile, 64-bit read may tear but a stale ms
+     * sample is harmless for an age computation). */
+    volatile uint64_t derp_last_heartbeat_ms;
+
     /* Key expiry (parsed from MapResponse self-node) */
     int64_t key_expiry_epoch;       /* Unix epoch seconds, 0 = no expiry */
     bool key_expired;               /* true if Node.Expired == true */

@@ -569,6 +569,18 @@ int microlink_get_peer_count(const microlink_t *ml) {
     return ml ? ml->peer_count : 0;
 }
 
+uint64_t microlink_get_last_derp_heartbeat_ms(const microlink_t *ml) {
+    return ml ? ml->derp_last_heartbeat_ms : 0;
+}
+
+void microlink_get_task_states(const microlink_t *ml, microlink_task_states_t *out) {
+    if (!out) return;
+    out->net_io  = (ml && ml->net_io_task)  ? (int)eTaskGetState(ml->net_io_task)  : -1;
+    out->derp_tx = (ml && ml->derp_tx_task) ? (int)eTaskGetState(ml->derp_tx_task) : -1;
+    out->coord   = (ml && ml->coord_task)   ? (int)eTaskGetState(ml->coord_task)   : -1;
+    out->wg_mgr  = (ml && ml->wg_mgr_task)  ? (int)eTaskGetState(ml->wg_mgr_task)  : -1;
+}
+
 esp_err_t microlink_get_peer_info(const microlink_t *ml, int index, microlink_peer_info_t *info) {
     if (!ml || !info || index < 0 || index >= ml->peer_count) {
         return ESP_ERR_INVALID_ARG;

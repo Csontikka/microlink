@@ -248,6 +248,25 @@ typedef struct {
 
 esp_err_t microlink_get_diag(const microlink_t *ml, microlink_diag_t *out);
 
+/* Liveness probe for the DERP I/O task: ml_get_time_ms() captured at the
+ * top of that task's most recent loop iteration. Subtract from a monotonic
+ * ms clock to get the "heartbeat age" — a value that climbs without bound
+ * when the task wedges in a socket call, which is the signature of the
+ * silent control-plane stall. Returns 0 if ml is NULL or it hasn't looped
+ * yet. */
+uint64_t microlink_get_last_derp_heartbeat_ms(const microlink_t *ml);
+
+/* eTaskState snapshot of the four internal worker tasks. Each field holds
+ * the FreeRTOS eTaskState (eRunning/eReady/eBlocked/eSuspended/eDeleted)
+ * cast to int, or -1 if the task handle has not been created yet. */
+typedef struct {
+    int net_io;
+    int derp_tx;
+    int coord;
+    int wg_mgr;
+} microlink_task_states_t;
+void microlink_get_task_states(const microlink_t *ml, microlink_task_states_t *out);
+
 /* DERP region RTT snapshot, one entry per region that responded to the
  * last netcheck. rtt_ms = 0 means the region was probed but timed out. */
 typedef struct {

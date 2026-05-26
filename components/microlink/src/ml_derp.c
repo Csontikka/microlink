@@ -497,6 +497,11 @@ void ml_derp_tx_task(void *arg) {
         loop_count++;
         uint64_t loop_start = ml_get_time_ms();
 
+        /* Liveness stamp for external diagnostics: refreshed every loop so
+         * the age stays small while the task runs and climbs without bound
+         * the instant it blocks in a socket call. */
+        ml->derp_last_heartbeat_ms = loop_start;
+
         /* Unconditional heartbeat - proves task is alive. Was ESP_LOGW so
          * it would survive any default-log-level filter while debugging
          * the DERP-stall issue; now downgraded to INFO since the /log
