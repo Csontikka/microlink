@@ -256,6 +256,15 @@ esp_err_t microlink_get_diag(const microlink_t *ml, microlink_diag_t *out);
  * yet. */
 uint64_t microlink_get_last_derp_heartbeat_ms(const microlink_t *ml);
 
+/* ml_get_time_ms() of the last frame RECEIVED from the control plane on the
+ * long-poll stream (PONG / server-PING / SETTINGS / keepalive / MapResponse).
+ * Unlike the coord watchdog's last_activity_ms this is NOT reset by our own
+ * 5 s PING send, so now - this value (coord_age) climbs as soon as the control
+ * plane goes silent — even while the device still reports CONNECTED. This is
+ * the signal for the silent control-plane wedge. Returns 0 if ml is NULL or
+ * not yet connected. */
+uint64_t microlink_get_ctrl_last_rx_ms(const microlink_t *ml);
+
 /* eTaskState snapshot of the four internal worker tasks. Each field holds
  * the FreeRTOS eTaskState (eRunning/eReady/eBlocked/eSuspended/eDeleted)
  * cast to int, or -1 if the task handle has not been created yet. */

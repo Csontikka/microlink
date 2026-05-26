@@ -508,6 +508,17 @@ struct microlink_s {
      * sample is harmless for an age computation). */
     volatile uint64_t derp_last_heartbeat_ms;
 
+    /* ml_get_time_ms() of the most recent frame RECEIVED from the control
+     * plane on the long-poll H2 stream (PONG, server PING, SETTINGS,
+     * keepalive, or a real MapResponse) — i.e. genuine proof the server is
+     * still talking to us. Distinct from the coord task's last_activity_ms
+     * watchdog, which is ALSO reset by our own 5 s PING *send* and therefore
+     * stays fresh even when the connection has gone half-open / black-hole
+     * (the 2026-05-26 wedge: web shows Connected while the control plane
+     * marks us offline). The SD recorder samples now - ctrl_last_rx_ms as
+     * coord_age, so a climbing value pinpoints exactly that silent stall. */
+    volatile uint64_t ctrl_last_rx_ms;
+
     /* Key expiry (parsed from MapResponse self-node) */
     int64_t key_expiry_epoch;       /* Unix epoch seconds, 0 = no expiry */
     bool key_expired;               /* true if Node.Expired == true */

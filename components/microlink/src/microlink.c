@@ -573,6 +573,10 @@ uint64_t microlink_get_last_derp_heartbeat_ms(const microlink_t *ml) {
     return ml ? ml->derp_last_heartbeat_ms : 0;
 }
 
+uint64_t microlink_get_ctrl_last_rx_ms(const microlink_t *ml) {
+    return ml ? ml->ctrl_last_rx_ms : 0;
+}
+
 void microlink_get_task_states(const microlink_t *ml, microlink_task_states_t *out) {
     if (!out) return;
     out->net_io  = (ml && ml->net_io_task)  ? (int)eTaskGetState(ml->net_io_task)  : -1;

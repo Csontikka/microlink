@@ -2528,6 +2528,9 @@ void ml_coord_task(void *arg) {
             ml->connected_at_ms = ml_get_time_ms();
             reconnect_attempts = 0;
             last_activity_ms = ml->connected_at_ms;
+            /* Seed the server-RX freshness clock at (re)connect; from here it
+             * only advances on genuine inbound frames (see poll_map_update). */
+            ml->ctrl_last_rx_ms = ml->connected_at_ms;
 
             /* Notify app */
             if (ml->state_cb) {
@@ -2745,6 +2748,12 @@ void ml_coord_task(void *arg) {
                 int poll_ret = poll_map_update(ml, &noise);
                 if (poll_ret > 0) {
                     last_activity_ms = now;  /* Reset watchdog */
+                    /* Genuine server-originated frame — unlike last_activity_ms
+                     * this is NOT touched by our own PING send, so coord_age
+                     * (now - ctrl_last_rx_ms) climbs the moment the control
+                     * plane goes silent even while the socket still accepts
+                     * writes. That climb is the wedge fingerprint. */
+                    ml->ctrl_last_rx_ms = now;
                 } else if (poll_ret < 0) {
                     ESP_LOGW(TAG, "Long-poll connection lost");
                     state = COORD_RECONNECTING;
