@@ -42,12 +42,18 @@ extern "C" {
  * Constants
  * ========================================================================== */
 
-/* Task configuration */
-#define ML_TASK_NET_IO_STACK    (8 * 1024)
+/* Task configuration.
+ * Stack sizes right-sized 2026-05-26 from measured high-water marks to free
+ * internal DRAM (FreeRTOS stacks are internal-only). Observed peak usage:
+ * net_io ~3.0K, derp_tx ~3.7K, coord ~8.3K (TLS + a 4K on-stack recv_buf),
+ * wg_mgr ~4.3K. Trimmed only the clearly-oversized ones, keeping a generous
+ * margin over the observed peak (TLS handshakes can spike). coord/wg_mgr
+ * left as-is — they run closer to their ceiling. */
+#define ML_TASK_NET_IO_STACK    (6 * 1024)   /* was 8K; ~3K peak observed */
 #define ML_TASK_NET_IO_PRIO     7
 #define ML_TASK_NET_IO_CORE     0
 
-#define ML_TASK_DERP_TX_STACK   (14 * 1024)
+#define ML_TASK_DERP_TX_STACK   (10 * 1024)  /* was 14K; ~3.7K peak observed */
 #define ML_TASK_DERP_TX_PRIO    5
 #define ML_TASK_DERP_TX_CORE    0
 
