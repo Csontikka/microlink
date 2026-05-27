@@ -517,11 +517,14 @@ esp_err_t ml_derp_queue_send(microlink_t *ml, const uint8_t *dest_key,
  * Unified DERP I/O Task
  * ========================================================================== */
 
+/* RX frame counter: incremented by the reader task (ml_derp_rx_task), read by
+ * the writer task's heartbeat/status logs. File-scope so both tasks see it. */
+static volatile uint32_t s_derp_frames_rx = 0;
+
 void ml_derp_tx_task(void *arg) {
     microlink_t *ml = (microlink_t *)arg;
     ESP_LOGI(TAG, "DERP I/O task started (Core %d)", xPortGetCoreID());
 
-    uint32_t frames_rx = 0;
     uint32_t frames_tx = 0;
     uint64_t last_status_ms = 0;
     uint32_t loop_count = 0;
@@ -549,7 +552,7 @@ void ml_derp_tx_task(void *arg) {
         if (loop_start - last_heartbeat_ms > 2000) {
             ESP_LOGW(TAG, "HEARTBEAT: loop=%lu conn=%d rx=%lu tx=%lu stack_free=%lu",
                      (unsigned long)loop_count, ml->derp.connected,
-                     (unsigned long)frames_rx, (unsigned long)frames_tx,
+                     (unsigned long)s_derp_frames_rx, (unsigned long)frames_tx,
                      (unsigned long)uxTaskGetStackHighWaterMark(NULL));
             last_heartbeat_ms = loop_start;
         }
@@ -560,7 +563,7 @@ void ml_derp_tx_task(void *arg) {
             if (now_ms - last_status_ms > 10000) {
                 ESP_LOGW(TAG, "DERP status: connected=%d fd=%d rx=%lu tx=%lu loops=%lu",
                          ml->derp.connected, ml->derp.sockfd,
-                         (unsigned long)frames_rx, (unsigned long)frames_tx,
+                         (unsigned long)s_derp_frames_rx, (unsigned long)frames_tx,
                          (unsigned long)loop_count);
                 last_status_ms = now_ms;
             }
@@ -591,6 +594,13 @@ void ml_derp_tx_task(void *arg) {
                 xEventGroupClearBits(ml->events, ML_EVT_DERP_RECONNECT);
                 ESP_LOGW(TAG, "DERP reconnect requested (was %s)",
                          ml->derp.connected ? "connected" : "disconnected");
+                /* Teardown race safety: ml_derp_disconnect destroys the ssl
+                 * context the reader task may be inside. Mark disconnected
+                 * first, then busy-wait (<=200ms) for the reader to park
+                 * (rx_parked=true => not touching ssl) before destroying it. */
+                ml->derp.connected = false;
+                for (int i = 0; i < 20 && !ml->derp.rx_parked; i++)
+                    vTaskDelay(pdMS_TO_TICKS(10));
                 ml_derp_disconnect(ml);
                 verbose_phase = false;
                 /* Auto-reconnect after disconnect. Backoff softened 2026-05-27
@@ -623,17 +633,24 @@ void ml_derp_tx_task(void *arg) {
             continue;
         }
 
-        bool did_work = false;
-        /* ---- Phase 1: Drain TX queue FIRST (prioritize outgoing) ----
+        /* ---- Phase 1: Drain TX queue (writer's only I/O work now) ----
          * Batch raised 8->32 (2026-05-27) so a single loop can clear a burst
-         * instead of dribbling 8 packets per RX-timeout window. */
+         * instead of dribbling 8 packets per RX-timeout window. The writer no
+         * longer does RX (moved to ml_derp_rx_task), so the first receive now
+         * BLOCKS up to 50ms instead of spinning: this paces the loop and still
+         * wakes within 50ms to re-check events/connected. Remaining items in
+         * the batch use timeout 0 to clear the burst in one pass. */
         {
             for (int tx_count = 0; tx_count < 32; tx_count++) {
                 ml_derp_tx_item_t item;
-                if (xQueueReceive(ml->derp_tx_queue, &item, 0) != pdTRUE) {
+                /* First item: block up to 50ms so the writer paces itself
+                 * (no RX work to fill idle loops anymore) and wakes within
+                 * 50ms to re-check events/connected. Rest of the batch:
+                 * timeout 0 to clear a burst in one pass. */
+                TickType_t wait = (tx_count == 0) ? pdMS_TO_TICKS(50) : 0;
+                if (xQueueReceive(ml->derp_tx_queue, &item, wait) != pdTRUE) {
                     break;
                 }
-                did_work = true;
                 if (!ml->derp.connected) {
                     free(item.data);
                     continue;
@@ -658,44 +675,52 @@ void ml_derp_tx_task(void *arg) {
                 free(item.data);
             }
         }
-
-        if (!ml->derp.connected) continue;
-
-        /* ---- Phase 2: Poll for incoming DERP frames ---- */
-        {
-            int burst;
-            for (burst = 0; burst < 32; burst++) {   /* 4->32 (2026-05-27): drain RX like Tailscale's tight Recv loop, don't dribble 4 frames/loop */
-                int ret = poll_derp_read(ml);
-                if (ret > 0) {
-                    frames_rx++;
-                    did_work = true;
-                    ml->derp.last_recv_ms = ml_get_time_ms();
-                } else if (ret == 0) {
-                    break;  /* No more data / timeout */
-                } else {
-                    ESP_LOGW(TAG, "DERP read error: %d", ret);
-                    ml->derp.connected = false;
-                    xEventGroupSetBits(ml->events, ML_EVT_DERP_RECONNECT);
-                    break;
-                }
-            }
-        }
-
-        /* Hot-spin fix (2026-05-27): the socket is O_NONBLOCK, so poll_derp_read
-         * returns instantly when idle, and pdMS_TO_TICKS(1) rounds to 0 ticks at
-         * FREERTOS_HZ=100 — the old vTaskDelay(1) never paced the loop. It spun
-         * ~9000×/s, burning a core and starving every prio<5 task (incl. Timer
-         * Svc → WG/lwip timer thrash). When a loop did real work, keep spinning
-         * (yield only) for throughput; when idle, block 10ms so lower-prio tasks
-         * run. Active transfers always do work, so this costs them nothing. */
-        if (did_work) {
-            taskYIELD();
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
+        /* Writer paces naturally by blocking up to 50ms on the queue above;
+         * RX (and its hot-spin pacing) now lives in ml_derp_rx_task. */
     }
 
     ESP_LOGI(TAG, "DERP I/O task exiting");
+    vTaskDelete(NULL);
+}
+
+/* ============================================================================
+ * DERP RX Task (reader) — owns mbedtls_ssl_read exclusively.
+ * One reader + one writer on the same ssl context is the documented mbedtls
+ * threading model (safe with renegotiation off, which DERP has). The reader
+ * never calls connect/disconnect; it parks (rx_parked=true) whenever it is
+ * not touching the ssl context so the writer can tear it down safely.
+ * ========================================================================== */
+
+void ml_derp_rx_task(void *arg) {
+    microlink_t *ml = (microlink_t *)arg;
+    ESP_LOGI(TAG, "DERP RX task started (Core %d)", xPortGetCoreID());
+    while (!(xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST)) {
+        if (!ml->derp.connected || ml->derp.sockfd < 0) {
+            ml->derp.rx_parked = true;      /* tell the writer it is safe to teardown */
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        ml->derp.rx_parked = false;
+        bool got = false;
+        for (int burst = 0; burst < 32; burst++) {
+            if (!ml->derp.connected) break;   /* re-check before each read, closes the race */
+            int ret = poll_derp_read(ml);
+            if (ret > 0) {
+                s_derp_frames_rx++;
+                ml->derp.last_recv_ms = ml_get_time_ms();
+                got = true;
+            } else if (ret == 0) {
+                break;                         /* no data right now */
+            } else {
+                ESP_LOGW(TAG, "DERP read error: %d", ret);
+                ml->derp.connected = false;
+                xEventGroupSetBits(ml->events, ML_EVT_DERP_RECONNECT);
+                break;
+            }
+        }
+        if (!got) vTaskDelay(pdMS_TO_TICKS(10));   /* idle: don't hot-spin (O_NONBLOCK) */
+    }
+    ESP_LOGI(TAG, "DERP RX task exiting");
     vTaskDelete(NULL);
 }
 

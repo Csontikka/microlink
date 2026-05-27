@@ -446,6 +446,17 @@ skip_bsd_socket:
         return ESP_FAIL;
     }
 
+    /* DERP reader: split out from the unified I/O task so RX (mbedtls_ssl_read)
+     * and TX (mbedtls_ssl_write) run concurrently on the same ssl context (one
+     * reader + one writer = the documented mbedtls threading model). Same
+     * stack/prio/core as the writer so the two time-slice predictably on core 0. */
+    ret = xTaskCreatePinnedToCore(ml_derp_rx_task, "ml_derp_rx", ML_TASK_DERP_TX_STACK,
+                                   ml, ML_TASK_DERP_TX_PRIO, &ml->derp_rx_task, ML_TASK_DERP_TX_CORE);
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create derp_rx task");
+        return ESP_FAIL;
+    }
+
     ret = xTaskCreatePinnedToCore(ml_coord_task, "ml_coord", ML_TASK_COORD_STACK,
                                    ml, ML_TASK_COORD_PRIO, &ml->coord_task, ML_TASK_COORD_CORE);
     if (ret != pdPASS) {
@@ -513,6 +524,7 @@ esp_err_t microlink_stop(microlink_t *ml) {
 
     ml->net_io_task = NULL;
     ml->derp_tx_task = NULL;
+    ml->derp_rx_task = NULL;
     ml->coord_task = NULL;
     ml->wg_mgr_task = NULL;
 

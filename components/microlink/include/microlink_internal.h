@@ -393,6 +393,7 @@ typedef struct {
     mbedtls_entropy_context entropy;
     mbedtls_ctr_drbg_context ctr_drbg;
     bool connected;
+    volatile bool rx_parked;        /* reader sets true when NOT touching the ssl context */
     uint64_t last_recv_ms;          /* For keepalive watchdog */
 } ml_derp_conn_t;
 
@@ -435,6 +436,7 @@ struct microlink_s {
     /* Task handles */
     TaskHandle_t net_io_task;
     TaskHandle_t derp_tx_task;
+    TaskHandle_t derp_rx_task;
     TaskHandle_t coord_task;
     TaskHandle_t wg_mgr_task;
 
@@ -584,6 +586,7 @@ void ml_net_io_task(void *arg);
 
 /* ml_derp.c */
 void ml_derp_tx_task(void *arg);
+void ml_derp_rx_task(void *arg);
 esp_err_t ml_derp_connect(microlink_t *ml);
 void ml_derp_disconnect(microlink_t *ml);
 esp_err_t ml_derp_queue_send(microlink_t *ml, const uint8_t *dest_key,
