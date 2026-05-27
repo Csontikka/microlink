@@ -66,9 +66,15 @@ extern "C" {
 #define ML_TASK_WG_MGR_CORE     1
 
 /* Queue depths */
-#define ML_DERP_TX_QUEUE_DEPTH  16
+/* TX 16->64 (2026-05-27): absorb speedtest bursts so packets queue instead of
+ * being dropped at enqueue; relay buffers are SPIRAM-backed (ml_psram_malloc),
+ * the queue control struct itself is ~64×48B internal (negligible). */
+#define ML_DERP_TX_QUEUE_DEPTH  64
 #define ML_DISCO_RX_QUEUE_DEPTH 8
-#define ML_WG_RX_QUEUE_DEPTH    8
+/* WG RX 8->32 (2026-05-27): download-direction frames arrive in bursts via DERP;
+ * depth 8 overflowed and silently dropped → TCP loss → exit-node throughput
+ * collapse. ml_rx_packet_t is small (ptr+len+meta); 32 is ~1KB internal. */
+#define ML_WG_RX_QUEUE_DEPTH    32
 #define ML_STUN_RX_QUEUE_DEPTH  4
 #define ML_COORD_CMD_QUEUE_DEPTH 4
 #define ML_PEER_UPDATE_QUEUE_DEPTH 400

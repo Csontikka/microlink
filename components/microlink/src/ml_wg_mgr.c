@@ -166,6 +166,11 @@ static err_t wg_derp_output_cb(const uint8_t *peer_public_key,
                 break;
             }
         }
+        /* Back to ESP_LOGI (compiled out by CONFIG_LOG_MAXIMUM_LEVEL=2) now that
+         * the DERP send path is proven working — this fires per handshake init
+         * (incl. offline DERP peers retrying ~every 5s) and was steady SD noise.
+         * To re-trace the egress, set WG_HS_TRACE=1 in wireguardif.c: its
+         * [WG_OUT_OK path=DERP derp_fn=1] line is the equivalent signal. */
         ESP_LOGI(TAG, "WG INIT -> %s len=%d key=%02x%02x%02x%02x%02x%02x%02x%02x",
                  hostname, (int)len,
                  peer_public_key[0], peer_public_key[1],
@@ -683,7 +688,7 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
                  * fires. Fire one DERP handshake init right now. */
                 wireguardif_connect_derp(netif, (u8_t)wg_peer_idx);
                 p->derp_fallback_active = true;
-                ESP_LOGI(TAG, "Exit-node DERP handshake init -> %s", p->hostname);
+                ESP_LOGW(TAG, "Exit-node DERP handshake init -> %s", p->hostname);
             }
 
             /* Accept-routes companion: attach any subnet routes the peer
@@ -1579,7 +1584,7 @@ esp_err_t ml_wg_mgr_trigger_handshake(microlink_t *ml, uint32_t dest_vpn_ip) {
 
     /* Path 1: DERP (reliable fallback) */
     wireguardif_connect_derp(netif, (u8_t)p->wg_peer_index);
-    ESP_LOGI(TAG, "WG handshake triggered (DERP) to %s", p->hostname);
+    ESP_LOGW(TAG, "WG handshake triggered (DERP) to %s", p->hostname);
 
     /* Path 2: Direct UDP (if DISCO has a known endpoint).
      * This wakes the peer's magicsock via receiveIPv4 → noteRecvActivity.
@@ -1592,7 +1597,7 @@ esp_err_t ml_wg_mgr_trigger_handshake(microlink_t *ml, uint32_t dest_vpn_ip) {
         wireguardif_update_endpoint(netif, (u8_t)p->wg_peer_index,
                                      &ep_ip, p->best_port);
         wireguardif_connect(netif, (u8_t)p->wg_peer_index);
-        ESP_LOGI(TAG, "WG handshake triggered (direct) to %s at %d.%d.%d.%d:%d",
+        ESP_LOGW(TAG, "WG handshake triggered (direct) to %s at %d.%d.%d.%d:%d",
                  p->hostname,
                  (int)((p->best_ip >> 24) & 0xFF), (int)((p->best_ip >> 16) & 0xFF),
                  (int)((p->best_ip >> 8) & 0xFF), (int)(p->best_ip & 0xFF),
@@ -1767,7 +1772,7 @@ static void disco_periodic_probes(microlink_t *ml) {
                 wireguardif_connect_derp(netif, (u8_t)p->wg_peer_index);
                 p->derp_fallback_active = true;
                 p->last_derp_attempt_ms = now;
-                ESP_LOGI(TAG, "DERP handshake %s -> %s (no WG session in %llus)",
+                ESP_LOGW(TAG, "DERP handshake %s -> %s (no WG session in %llus)",
                          first_attempt ? "init" : "retry",
                          p->hostname,
                          (unsigned long long)((now - p->peer_added_ms) / 1000));
@@ -2046,6 +2051,16 @@ void ml_wg_mgr_task(void *arg) {
                 ESP_LOGW(TAG, "disco_periodic_probes SLOW: %llu ms",
                          (unsigned long long)dt);
             }
+        }
+
+        /* Re-drain WG RX after the (sometimes 30-66ms) periodic + disco work
+         * above. This single task owns both the wg_rx_queue consumer AND the
+         * slow crypto/probe paths; without this second drain, download frames
+         * pile up in wg_rx_queue and overflow (→ DERP-RX drops → TCP backoff →
+         * the sustained rate falls well below the burst peak) while the task
+         * was busy. 2026-05-27. */
+        while (xQueueReceive(ml->wg_rx_queue, &wg_pkt, 0) == pdTRUE) {
+            process_wg_packet(ml, &wg_pkt);
         }
 
         /* Throughput-collapse diag: full state snapshot every 10 s. */
