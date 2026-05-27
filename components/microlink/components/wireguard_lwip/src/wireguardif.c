@@ -1307,9 +1307,25 @@ void wireguardif_periodic(struct netif *netif) {
 
 	// Perform the same work as wireguardif_tmr but from the caller's task context,
 	// avoiding heavy crypto (X25519, ChaCha20-Poly1305) on the lwIP TCPIP thread.
+	//
+	// Throughput fix (2026-05-24): wireguard_start_handshake() costs ~40ms per
+	// peer (X25519 + ChaCha20-Poly1305 + Curve25519 ECDH). With N peers eligible
+	// for retry on the same tick (typical: broken DERP-only peers that haven't
+	// seen an RX yet), the original "send to all" loop blocked the calling task
+	// for N * 40ms ≈ 280ms with 7 peers. Even with exit-node OFF, this is fatal:
+	// the AP→STA NAPT forward path runs on the same task (tiT / ml_wg_mgr),
+	// so a 280ms blockage backlogs the AP RX queue, drops MAC-level frames, and
+	// collapses phone upload throughput mid-test. Throttle to 1 init per tick +
+	// round-robin so each peer still gets a chance within WIREGUARD_MAX_PEERS
+	// ticks.
+	static int s_next_hs_peer_idx = 0;
+	int handshakes_this_tick = 0;
+	const int MAX_HANDSHAKES_PER_TICK = 1;
+
 	bool link_up = false;
 	for (x = 0; x < WIREGUARD_MAX_PEERS; x++) {
-		peer = &device->peers[x];
+		int peer_idx = (s_next_hs_peer_idx + x) % WIREGUARD_MAX_PEERS;
+		peer = &device->peers[peer_idx];
 		if (peer->valid) {
 			if (should_reset_peer(peer)) {
 				keypair_destroy(&peer->next_keypair);
@@ -1325,17 +1341,22 @@ void wireguardif_periodic(struct netif *netif) {
 				wireguardif_send_keepalive(device, peer);
 			}
 			if (should_send_initiation(peer)) {
-				printf("[WG_PERIODIC] Handshake retry wg_idx=%d key=%02x%02x%02x%02x "
-				       "ip=%s:%u connect_ip=%s:%u active=%d send_hs=%d\n",
-				       x,
-				       peer->public_key[0], peer->public_key[1],
-				       peer->public_key[2], peer->public_key[3],
-				       ip_addr_isany(&peer->ip) ? "0.0.0.0" : ipaddr_ntoa(&peer->ip),
-				       peer->port,
-				       ip_addr_isany(&peer->connect_ip) ? "0.0.0.0" : ipaddr_ntoa(&peer->connect_ip),
-				       peer->connect_port,
-				       peer->active, peer->send_handshake);
-				wireguard_start_handshake(device->netif, peer);
+				if (handshakes_this_tick < MAX_HANDSHAKES_PER_TICK) {
+					printf("[WG_PERIODIC] Handshake retry wg_idx=%d key=%02x%02x%02x%02x "
+					       "ip=%s:%u connect_ip=%s:%u active=%d send_hs=%d\n",
+					       peer_idx,
+					       peer->public_key[0], peer->public_key[1],
+					       peer->public_key[2], peer->public_key[3],
+					       ip_addr_isany(&peer->ip) ? "0.0.0.0" : ipaddr_ntoa(&peer->ip),
+					       peer->port,
+					       ip_addr_isany(&peer->connect_ip) ? "0.0.0.0" : ipaddr_ntoa(&peer->connect_ip),
+					       peer->connect_port,
+					       peer->active, peer->send_handshake);
+					wireguard_start_handshake(device->netif, peer);
+					handshakes_this_tick++;
+					s_next_hs_peer_idx = (peer_idx + 1) % WIREGUARD_MAX_PEERS;
+				}
+				// else: throttled this tick, next tick (round-robin) gets the chance
 			}
 			if ((peer->curr_keypair.valid) || (peer->prev_keypair.valid)) {
 				link_up = true;
