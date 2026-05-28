@@ -224,7 +224,10 @@ static void pin_wg_output_cb(void *ctx)
 
 esp_err_t microlink_pin_wg_output_netif(microlink_t *ml, struct netif *upstream)
 {
-    (void)ml;
+    /* Remember the upstream (STA) netif so the coord + DERP tasks can pin
+     * their own self-origin sockets to it on (re)connect — see
+     * ml_bind_sock_to_upstream(). upstream == NULL (exit-node off) clears it. */
+    if (ml) ml->upstream_netif = (void *)upstream;
     if (!s_wg_output_pcb) return ESP_ERR_INVALID_STATE;
     tcpip_callback_with_block(pin_wg_output_cb, (void *)upstream, 1);
     return ESP_OK;

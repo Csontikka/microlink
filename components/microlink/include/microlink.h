@@ -100,6 +100,11 @@ typedef struct {
     bool online;
     bool direct_path;           /* true if communicating via direct UDP */
     bool is_exit_node;          /* true if peer advertises 0.0.0.0/0 in AllowedIPs */
+    uint16_t derp_region;       /* peer's home DERP region id (from Node.HomeDERP /
+                                 * legacy DERP "127.3.3.40:N"); 0 = unknown. When
+                                 * direct_path is false this is the region the peer
+                                 * is relayed through. Name via
+                                 * microlink_get_derp_region_name(). */
     /* Subnet routes the peer advertises (parsed from AllowedIPs,
      * excluding the peer's own /32 in CGNAT and 0.0.0.0/0 — those
      * are reported separately). */

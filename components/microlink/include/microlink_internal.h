@@ -86,6 +86,11 @@ extern "C" {
 #define ML_DERP_MAX_FRAME       (ML_MAX_PACKET_SIZE + 64)
 
 /* DERP */
+/* 2026-05-28: tried region 26 (Nuremberg, = tailscale-105's home DERP) to kill
+ * the Frankfurt->Nuremberg mesh hop — but it BROKE the tailscale-105 session
+ * (no WG handshake completed, both runtime-config and code-level). Frankfurt(4)
+ * works (the mesh relays fine, ~0.3 Mbit). Reverted. The real fix needs proper
+ * netcheck + per-peer home-region relaying, not a single hard-coded region. */
 #define ML_DERP_REGION          4       /* Frankfurt (fra) - closer to EU + matches typical peer home DERP */
 #define ML_DERP_HOST            "derp4.tailscale.com"
 #define ML_DERP_PORT            443
@@ -473,6 +478,15 @@ struct microlink_s {
     /* WireGuard netif (owned exclusively by wg_mgr task) */
     void *wg_netif;
 
+    /* Upstream (physical STA) netif to pin the ESP's OWN control-plane +
+     * DERP sockets to, set by microlink_pin_wg_output_netif() in exit-node
+     * mode. When an exit node is active main flips netif_default to the WG
+     * tunnel; our self-origin control/DERP TCP must still egress the real
+     * uplink (else errno EHOSTUNREACH / MBEDTLS_ERR_NET_SEND_FAILED). NULL
+     * = exit-node off → netif_default is already the STA, no pin needed.
+     * Mirrors tailscale Go's bindToDevice for the control + DERP dialers. */
+    void *upstream_netif;
+
     /* Peers (owned exclusively by wg_mgr task) */
     ml_peer_t peers[ML_MAX_PEERS];
     int peer_count;
@@ -594,6 +608,11 @@ esp_err_t ml_derp_queue_send(microlink_t *ml, const uint8_t *dest_key,
 
 /* ml_coord.c */
 void ml_coord_task(void *arg);
+/* Pin a freshly-created BSD socket (control-plane or DERP) to ml->upstream_netif
+ * via SO_BINDTODEVICE so the ESP's own self-origin traffic always egresses the
+ * physical uplink, never the exit-node WG tunnel. No-op when no upstream is
+ * pinned (exit-node off). Defined in ml_coord.c, also called from ml_derp.c. */
+void ml_bind_sock_to_upstream(microlink_t *ml, int fd);
 
 /* ml_wg_mgr.c */
 void ml_wg_mgr_task(void *arg);

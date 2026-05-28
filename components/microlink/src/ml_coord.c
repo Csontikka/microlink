@@ -30,11 +30,36 @@
 #include "cJSON.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
+#include "lwip/netif.h"
 #include "mbedtls/base64.h"
 #include <string.h>
 #include <errno.h>
 
 static const char *TAG = "ml_coord";
+
+/* Pin a freshly-created BSD socket to the upstream (STA) netif via
+ * SO_BINDTODEVICE (lwIP -> tcp_bind_netif), so the ESP's OWN control-plane /
+ * DERP TCP always egresses the physical uplink and is immune to the
+ * exit-node netif_default flip (which would otherwise blackhole these
+ * self-origin sessions: coord_recv errno 113 EHOSTUNREACH, DERP TLS write
+ * -0x004e MBEDTLS_ERR_NET_SEND_FAILED). Mirrors tailscale Go's bindToDevice
+ * for the control + DERP dialers, and the existing WG-UDP udp_bind_netif pin.
+ * No-op when no upstream is pinned (exit-node off -> netif_default == STA
+ * already). A bind error is non-fatal: it just leaves the prior routing. */
+void ml_bind_sock_to_upstream(microlink_t *ml, int fd)
+{
+    if (!ml || fd < 0 || !ml->upstream_netif) return;
+    struct netif *up = (struct netif *)ml->upstream_netif;
+    if (!netif_is_up(up) || !netif_is_link_up(up)) return;
+    struct ifreq ifr = {0};
+    netif_index_to_name(netif_get_index(up), ifr.ifr_name);
+    if (ml_setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(ifr)) == 0) {
+        ESP_LOGI(TAG, "self-origin sock %d pinned to upstream %s", fd, ifr.ifr_name);
+    } else {
+        ESP_LOGW(TAG, "SO_BINDTODEVICE(%s) on sock %d failed: errno %d",
+                 ifr.ifr_name, fd, errno);
+    }
+}
 
 /* Effective control plane host: NVS override or compiled default */
 #define CTRL_HOST(ml) ((ml)->ctrl_host[0] ? (ml)->ctrl_host : ML_CTRL_HOST)
@@ -281,6 +306,9 @@ static int do_tcp_connect(microlink_t *ml) {
     ml_setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
     ml_setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
     ml_setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
+
+    /* Keep the control-plane socket off the exit-node tunnel (see helper). */
+    ml_bind_sock_to_upstream(ml, sock);
 
     ESP_LOGI(TAG, "Connecting to %s:80...", CTRL_HOST(ml));
 

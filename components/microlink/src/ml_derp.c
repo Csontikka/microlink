@@ -787,6 +787,10 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     ml_setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     ml_setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
+    /* Keep the DERP socket off the exit-node tunnel (self-origin must use the
+     * physical uplink, not the WG default route — see ml_bind_sock_to_upstream). */
+    ml_bind_sock_to_upstream(ml, sock);
+
     if (ml_connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
         ESP_LOGE(TAG, "TCP connect failed: %d", errno);
         ml_close_sock(sock);

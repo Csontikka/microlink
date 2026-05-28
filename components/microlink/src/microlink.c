@@ -632,6 +632,7 @@ esp_err_t microlink_get_peer_info(const microlink_t *ml, int index, microlink_pe
     info->online = p->online && p->active;
     info->direct_path = p->has_direct_path;
     info->is_exit_node = p->is_exit_node;
+    info->derp_region = p->derp_region;
     info->subnet_route_count = p->subnet_route_count;
     if (info->subnet_route_count > MICROLINK_MAX_PEER_ROUTES) {
         info->subnet_route_count = MICROLINK_MAX_PEER_ROUTES;
