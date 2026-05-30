@@ -1763,15 +1763,27 @@ static void disco_periodic_probes(microlink_t *ml) {
          * Skips peers with a direct PONG (those use the regular endpoint
          * upgrade path), and clears the retry flag in process_disco_pong()
          * when a direct PONG eventually wins. */
-        if (!p->has_direct_path &&
-            p->wg_peer_index >= 0 && ml->wg_netif &&
+        /* (2026-05-30) Gate on the WireGuard DATA plane (up != ERR_OK), NOT
+         * the DISCO control-plane has_direct_path latch. A peer whose DISCO
+         * PONGs keep arriving (has_direct_path stays true, trust_until_ms
+         * re-armed every <60 s) but whose encrypted WG handshake never
+         * completes (lastrx=never, hs_attempts climbing) was previously
+         * skipped here forever — that is the exit-node-after-roam/reboot
+         * wedge that black-holed all AP-client internet (direct=1, derp_fb=0,
+         * lastrx=never). A healthy direct peer has a valid keypair
+         * (up == ERR_OK) so it never enters this block; the 2026-05-24
+         * throughput case (keypair valid, DISCO pings starved) is likewise
+         * untouched. The 30 s attempt cadence is uniform so PONGs that clear
+         * derp_fallback_active can't make us re-fire faster than every 30 s. */
+        if (p->wg_peer_index >= 0 && ml->wg_netif &&
             now - p->peer_added_ms > 30000) {
             struct netif *netif = (struct netif *)ml->wg_netif;
             err_t up = wireguardif_peer_is_up(netif, (u8_t)p->wg_peer_index,
                                                 NULL, NULL);
             bool first_attempt = !p->derp_fallback_active;
-            bool retry_due = !first_attempt && (now - p->last_derp_attempt_ms > 30000);
-            if (up != ERR_OK && (first_attempt || retry_due)) {
+            bool attempt_due = (p->last_derp_attempt_ms == 0) ||
+                               (now - p->last_derp_attempt_ms > 30000);
+            if (up != ERR_OK && attempt_due) {
                 wireguardif_connect_derp(netif, (u8_t)p->wg_peer_index);
                 p->derp_fallback_active = true;
                 p->last_derp_attempt_ms = now;
