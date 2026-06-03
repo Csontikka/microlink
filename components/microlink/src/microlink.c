@@ -598,6 +598,32 @@ uint32_t microlink_get_vpn_ip(const microlink_t *ml) {
     return ml ? ml->vpn_ip : 0;
 }
 
+int64_t microlink_get_key_expiry(const microlink_t *ml) {
+    return ml ? ml->key_expiry_epoch : 0;
+}
+
+esp_err_t microlink_rebind(microlink_t *ml) {
+    if (!ml) return ESP_ERR_INVALID_ARG;
+    if (ml->state == ML_STATE_IDLE) return ESP_ERR_INVALID_STATE;
+
+    ESP_LOGI(TAG, "=== Rebind: forcing coord + DERP reconnect ===");
+
+    /* Signal the coord task to reconnect. Its ML_CMD_FORCE_RECONNECT path
+     * (COORD_RECONNECTING) tears down and re-runs the full
+     * STUN -> DNS -> TCP -> Noise -> Register -> MapRequest flow, rebuilding
+     * its own sockets; peers and WG state are preserved. */
+    xEventGroupClearBits(ml->events, ML_EVT_COORD_REGISTERED);
+    ml_coord_cmd_t cmd = ML_CMD_FORCE_RECONNECT;
+    xQueueSend(ml->coord_cmd_queue, &cmd, pdMS_TO_TICKS(100));
+
+    /* Signal the DERP I/O task to drop its TLS session and reconnect with a
+     * fresh handshake (it watches ML_EVT_DERP_RECONNECT directly). */
+    xEventGroupClearBits(ml->events, ML_EVT_DERP_CONNECTED);
+    xEventGroupSetBits(ml->events, ML_EVT_DERP_RECONNECT);
+
+    return ESP_OK;
+}
+
 int microlink_get_peer_count(const microlink_t *ml) {
     return ml ? ml->peer_count : 0;
 }

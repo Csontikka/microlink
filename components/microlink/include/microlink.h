@@ -170,6 +170,18 @@ esp_err_t microlink_start(microlink_t *ml);
 esp_err_t microlink_stop(microlink_t *ml);
 
 /**
+ * @brief Soft-reconnect: force the coordination + DERP links to reconnect.
+ * @param ml Handle
+ * @return ESP_OK on success, ESP_ERR_INVALID_STATE if idle
+ *
+ * Signals the coord task (FORCE_RECONNECT) and DERP I/O task to tear down
+ * and re-establish their connections. Peers and WireGuard state are
+ * preserved. Lighter than a full microlink_stop()/microlink_start() cycle;
+ * used as the first self-healing step before escalating to a full restart.
+ */
+esp_err_t microlink_rebind(microlink_t *ml);
+
+/**
  * @brief Destroy MicroLink instance and free all resources
  * @param ml Handle (NULL-safe)
  */
@@ -190,6 +202,12 @@ bool microlink_is_connected(const microlink_t *ml);
  * @return VPN IP in host byte order, 0 if not yet assigned
  */
 uint32_t microlink_get_vpn_ip(const microlink_t *ml);
+
+/**
+ * @brief Get the node/auth key expiry time.
+ * @return Expiry timestamp (Unix epoch seconds), or 0 if unknown / no expiry.
+ */
+int64_t microlink_get_key_expiry(const microlink_t *ml);
 
 /**
  * @brief Pin the magicsock WG output PCB to a specific upstream netif.
