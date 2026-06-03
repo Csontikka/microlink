@@ -37,8 +37,8 @@ static const char *TAG = "microlink";
 #define NVS_KEY_DISCO_PRI   "disco_pri"
 #define NVS_KEY_DISCO_PUB   "disco_pub"
 
-/* X25519 from x25519.h */
-#include "x25519.h"
+/* X25519 from ml_x25519.h */
+#include "ml_x25519.h"
 
 /* ============================================================================
  * Key Management (loaded once at init, read-only after)
@@ -49,7 +49,7 @@ static void generate_keypair(uint8_t *private_key, uint8_t *public_key) {
     private_key[0] &= 248;
     private_key[31] &= 127;
     private_key[31] |= 64;
-    x25519_base(public_key, private_key, 1);
+    ml_x25519_base(public_key, private_key, 1);
 }
 
 static esp_err_t load_or_generate_keys(microlink_t *ml) {

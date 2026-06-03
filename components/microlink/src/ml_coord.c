@@ -22,7 +22,7 @@
  */
 
 #include "microlink_internal.h"
-#include "x25519.h"
+#include "ml_x25519.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_random.h"
@@ -802,7 +802,7 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
         challenge_pub_copy[31] &= 0x7F;  /* Clear high bit per RFC 7748 */
 
         uint8_t challenge_response[32];
-        x25519(challenge_response, ml->wg_private_key, challenge_pub_copy, 1);
+        ml_x25519(challenge_response, ml->wg_private_key, challenge_pub_copy, 1);
 
         /* Encode as "chalresp:hex..." */
         char chalresp_hex[65];
