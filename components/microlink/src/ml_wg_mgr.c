@@ -316,6 +316,38 @@ static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
 
     err_t err = udp_sendto(s_wg_output_pcb, p, &dst, dest_port);
     pbuf_free(p);
+
+    /* tailscale "send both" (wgengine/magicsock/endpoint.go send): a WireGuard
+     * HANDSHAKE packet (type 0x01 init / 0x02 response / 0x03 cookie) is ALSO
+     * relayed via DERP, not only sent to the direct endpoint. DERP is the
+     * reliable bootstrap path that always works (both peers hold a home-DERP
+     * connection); direct is an opportunistic upgrade. Without this, a peer
+     * behind an aggressive symmetric NAT (per-packet source-port remap) never
+     * completes the handshake: the direct copy goes to a port the peer no longer
+     * uses and is silently dropped, and microlink's exclusive direct-OR-DERP
+     * flip never reliably lands the init on DERP. Bulk data (type 0x04) is NOT
+     * duplicated here -- the existing direct path + 30s DERP-fallback carry it
+     * once the session is up. Peer found by dest address (host-order endpoints
+     * vs network-order dest_ip). */
+    if (len >= 1 && (data[0] == 0x01 || data[0] == 0x02 || data[0] == 0x03)) {
+        for (int pi = 0; pi < ml->peer_count; pi++) {
+            ml_peer_t *pr = &ml->peers[pi];
+            bool match = (pr->best_ip && htonl(pr->best_ip) == dest_ip);
+            if (!match) {
+                for (int e = 0; e < pr->endpoint_count && e < ML_MAX_ENDPOINTS; e++) {
+                    if (!pr->endpoints[e].is_ipv6 && pr->endpoints[e].ip &&
+                        htonl(pr->endpoints[e].ip) == dest_ip) { match = true; break; }
+                }
+            }
+            if (match) {
+                ml_derp_queue_send(ml, pr->public_key, data, len);
+                ESP_LOGI(TAG, "WG send-both: handshake type=%d also relayed via DERP to %s",
+                         (int)data[0], pr->hostname);
+                break;
+            }
+        }
+    }
+
     return err;
 }
 

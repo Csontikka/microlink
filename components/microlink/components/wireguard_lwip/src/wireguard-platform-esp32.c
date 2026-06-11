@@ -8,6 +8,7 @@
 #include "esp_timer.h"
 #include "lwip/sys.h"
 #include <string.h>
+#include <sys/time.h>
 
 /* ============================================================================
  * Time Functions
@@ -35,15 +36,33 @@ void wireguard_set_tai64n_base_seconds(uint64_t base_seconds) {
 }
 
 void wireguard_tai64n_now(uint8_t *output) {
-    uint64_t now_us = esp_timer_get_time();
-    uint64_t seconds = s_tai_base_seconds + (now_us / 1000000ULL);
-    uint32_t nanoseconds = (now_us % 1000000ULL) * 1000;
-    static uint64_t last_log = 0;
-    if (seconds - last_log > 10) {
-        printf("[TAI64N] base=%llu now=%llu\n",
-               (unsigned long long)s_tai_base_seconds,
-               (unsigned long long)seconds);
-        last_log = seconds;
+    uint64_t seconds;
+    uint32_t nanoseconds;
+
+    /* Prefer the SNTP-synced real wall clock, sampled PER EMIT. It is
+     * monotonic across reboots and always far greater than any uptime or
+     * per-boot-counter value, so a peer never rejects our handshake initiation
+     * as a replay (the WireGuard spec makes the responder DROP any init whose
+     * TAI64N timestamp is <= the greatest it has seen from us).
+     *
+     * Why per-emit and not the cached base: wireguard_set_tai64n_base_seconds()
+     * is called ONCE at microlink init — typically BEFORE SNTP has synced — so
+     * it falls back to a "+1 day per boot" NVS counter. That counter regresses
+     * below the peer's stored timestamp whenever the previous boot ran longer
+     * than the increment (e.g. a 6-day uptime emits base+6d, the next boot only
+     * sets base+1d), which silently wedges EVERY ESP-initiated handshake until
+     * the peer happens to initiate toward us. Sampling the wall clock here, once
+     * SNTP has set it, self-heals without any re-init. The cached base remains
+     * the pre-sync fallback. */
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    if ((uint64_t)tv.tv_sec > 1700000000ULL) {
+        seconds = (uint64_t)tv.tv_sec;
+        nanoseconds = (uint32_t)(tv.tv_usec * 1000);
+    } else {
+        uint64_t now_us = esp_timer_get_time();
+        seconds = s_tai_base_seconds + (now_us / 1000000ULL);
+        nanoseconds = (uint32_t)((now_us % 1000000ULL) * 1000);
     }
 
     /* TAI64 base: 2^62 + Unix time (TAI is +10s from UTC at epoch). */
