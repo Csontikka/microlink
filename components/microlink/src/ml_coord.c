@@ -21,6 +21,7 @@
  *            tailscale/control/controlclient/direct.go
  */
 
+#include <ctype.h>
 #include "microlink_internal.h"
 #include "ml_x25519.h"
 #include "esp_log.h"
@@ -534,6 +535,14 @@ static void ml_conn_close(microlink_t *ml) {
         ml_close_sock(ml->coord_sock);
         ml->coord_sock = -1;
     }
+
+    /* Drop any partially-received HTTP/2 frame and any partially-assembled
+     * map message. These belong to the session that just ended; carrying them
+     * into the next one prepends stale bytes to its FIRST framed message -
+     * which is the initial full netmap, the most valuable message on the
+     * stream. It would be lost to the length-prefix guard. */
+    ml->h2_acc_len = 0;
+    ml->lp_acc_len = 0;
 }
 
 /* ============================================================================
@@ -1603,6 +1612,9 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
  * State: FETCH_PEERS - Send MapRequest, parse MapResponse
  * ========================================================================== */
 
+/* Defined below with the long-poll reader; both map paths share one framed stream. */
+static void lp_acc_append(microlink_t *ml, const uint8_t *data, size_t len);
+
 static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
     /* Try all field names used by Tailscale (copied from v1 lines 3176-3184):
      *   "Peers"        - Full peer list (initial Stream=false response)
@@ -2347,22 +2359,20 @@ static int do_map_exchange(microlink_t *ml, ml_noise_state_t *noise, bool send_r
         /* Streaming responses (send_request=false) never carry END_STREAM —
          * the message boundary is the 4-byte length prefix in front of the
          * JSON body. Stop reading once the prefixed message is complete.
-         * The prefix endianness is not spelled out anywhere authoritative
-         * for this stack, so accept whichever plausible reading is larger;
-         * an implausible prefix simply falls back to the recv timeout. */
+         *
+         * The prefix is little-endian; this used to try both endiannesses and
+         * take whichever looked larger, which could overestimate how long to
+         * wait. See control/controlclient/direct.go:1303-1311, which this
+         * series now follows everywhere else - reading it two ways here while
+         * asserting one reading elsewhere was inconsistent. */
         if (!send_request && !got_end_stream &&
             first_data_payload && first_data_len >= 4) {
             uint32_t le = (uint32_t)first_data_payload[0] |
                           ((uint32_t)first_data_payload[1] << 8) |
                           ((uint32_t)first_data_payload[2] << 16) |
                           ((uint32_t)first_data_payload[3] << 24);
-            uint32_t be = ((uint32_t)first_data_payload[0] << 24) |
-                          ((uint32_t)first_data_payload[1] << 16) |
-                          ((uint32_t)first_data_payload[2] << 8) |
-                           (uint32_t)first_data_payload[3];
             uint32_t need = 0;
             if (le >= 2 && le < ML_JSON_BUFFER_SIZE) need = le;
-            if (be >= 2 && be < ML_JSON_BUFFER_SIZE && be > need) need = be;
             if (need > 0 && scan_data_total >= (size_t)need + 4) {
                 ESP_LOGI(TAG, "Streamed MapResponse complete (%lu+4 bytes) after %d Noise frames",
                          (unsigned long)need, read_count + 1);
@@ -2475,41 +2485,56 @@ static int do_map_exchange(microlink_t *ml, ml_noise_state_t *noise, bool send_r
         ESP_LOGI(TAG, "MapResponse first %d bytes (hex): %s", dump, hexbuf);
     }
 
-    /* Check for length prefix (Tailscale binary framing: 4-byte big-endian length before JSON) */
+    /* Framed read, per tailscale/control/controlclient/direct.go:1294-1311. The reference
+     * uses ONE reader for both cases and says so explicitly:
+     *
+     *     // If allowStream, then the server will use an HTTP long poll to
+     *     // return incremental results. There is always one response right
+     *     // away, followed by a delay, and eventually others.
+     *     // If !allowStream, it'll still send the first result in exactly
+     *     // the same format before just closing the connection.
+     *     // We can use this same read loop either way.
+     *     var siz [4]byte; io.ReadFull(res.Body, siz[:])
+     *     size := binary.LittleEndian.Uint32(siz[:])
+     *     msg = append(msg[:0], make([]byte, size)...); io.ReadFull(res.Body, msg)
+     *
+     * So EVERY message on this path is 4-byte little-endian length + that many bytes,
+     * streamed or not. This previously sniffed for '{' in the first 8 bytes, probed BOTH
+     * endiannesses, clamped to the first message and then DISCARDED the remainder - which
+     * left the long-poll reader starting mid-message on its very first read.
+     *
+     * Now: read the length, parse exactly that message, and hand any trailing bytes to the
+     * long-poll accumulator so the two paths form one continuous framed stream. */
     char *parse_start = (char *)resp_buf;
     size_t parse_len = json_total;
 
-    /* Find the start of JSON - look for '{' in first 8 bytes */
-    int json_offset = -1;
-    for (int i = 0; i < 8 && i < (int)json_total; i++) {
-        if (resp_buf[i] == '{') {
-            json_offset = i;
-            break;
-        }
-    }
-    if (json_offset > 0) {
-        ESP_LOGI(TAG, "JSON starts at offset %d (skipping %d-byte prefix)", json_offset, json_offset);
-        parse_start += json_offset;
-        parse_len -= json_offset;
-    } else if (json_offset < 0) {
-        ESP_LOGW(TAG, "No '{' found in first 8 bytes of MapResponse!");
-    }
-
-    /* Stream mode: the buffer may already hold the START of the next
-     * length-prefixed message behind the first one — clamp parsing to the
-     * first message, or cJSON chokes on the trailing bytes. */
-    if (!send_request && json_offset == 4 && json_total > 4) {
-        uint32_t le = (uint32_t)resp_buf[0] | ((uint32_t)resp_buf[1] << 8) |
-                      ((uint32_t)resp_buf[2] << 16) | ((uint32_t)resp_buf[3] << 24);
-        uint32_t be = ((uint32_t)resp_buf[0] << 24) | ((uint32_t)resp_buf[1] << 16) |
-                      ((uint32_t)resp_buf[2] << 8) | (uint32_t)resp_buf[3];
-        uint32_t body = 0;
-        if (le >= 2 && le <= parse_len) body = le;
-        else if (be >= 2 && be <= parse_len) body = be;
-        if (body > 0 && body < parse_len) {
-            ESP_LOGI(TAG, "Clamping streamed MapResponse parse to first message (%lu of %lu bytes)",
-                     (unsigned long)body, (unsigned long)parse_len);
-            parse_len = body;
+    if (json_total >= 4) {
+        uint32_t size = (uint32_t)resp_buf[0] | ((uint32_t)resp_buf[1] << 8) |
+                        ((uint32_t)resp_buf[2] << 16) | ((uint32_t)resp_buf[3] << 24);
+        if (size >= 2 && (size_t)size <= json_total - 4) {
+            parse_start = (char *)resp_buf + 4;
+            parse_len = size;
+            size_t rest_off = 4 + (size_t)size;
+            if (rest_off < json_total) {
+                /* Tail belongs to the NEXT message - carry it, do not drop it. */
+                ESP_LOGI(TAG, "MapResponse: %lu-byte message, %u trailing byte(s) carried to long-poll",
+                         (unsigned long)size, (unsigned)(json_total - rest_off));
+                lp_acc_append(ml, resp_buf + rest_off, json_total - rest_off);
+            }
+        } else {
+            /* No usable prefix. Fall back to the old '{' sniff so a control plane that
+             * frames differently still works, but say so - it should not happen. */
+            int json_offset = -1;
+            for (int k = 0; k < 8 && k < (int)json_total; k++) {
+                if (resp_buf[k] == '{') { json_offset = k; break; }
+            }
+            ESP_LOGW(TAG, "MapResponse: no valid length prefix (size=%lu, have %u) - "
+                          "falling back to '{' sniff at offset %d",
+                     (unsigned long)size, (unsigned)json_total, json_offset);
+            if (json_offset > 0) {
+                parse_start += json_offset;
+                parse_len   -= json_offset;
+            }
         }
     }
 
@@ -2869,6 +2894,71 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
 }
 
 /* Try to read one incremental MapResponse update (non-blocking) */
+/* Apply one fully-decoded MapResponse from the long-poll stream.
+ * Extracted from poll_map_update so the caller can drive it once per COMPLETE message rather than
+ * once per socket read. See the reassembly note on microlink_t::lp_acc. */
+static void apply_long_poll_map(microlink_t *ml, cJSON *update_json) {
+    ESP_LOGI(TAG, "Long-poll MapResponse update received");
+
+    /* Update VPN IP if present */
+    cJSON *node = cJSON_GetObjectItem(update_json, "Node");
+    if (node) {
+        cJSON *addresses = cJSON_GetObjectItem(node, "Addresses");
+        if (addresses && cJSON_GetArraySize(addresses) > 0) {
+            const char *addr = cJSON_GetArrayItem(addresses, 0)->valuestring;
+            if (addr) {
+                unsigned a, b, c, d;
+                if (sscanf(addr, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
+                    uint32_t new_ip = (a << 24) | (b << 16) | (c << 8) | d;
+                    if (new_ip != ml->vpn_ip) {
+                        ml->vpn_ip = new_ip;
+                        ESP_LOGI(TAG, "VPN IP updated via long-poll");
+                    }
+                }
+            }
+        }
+    }
+
+    /* Parse peer updates */
+    parse_peers_from_map_response(ml, update_json);
+
+    /* The DERPMap can arrive on the stream too - Headscale >= 0.26 delivers the ENTIRE initial
+     * netmap here (the non-streaming fetch returns an empty body, see do_map_exchange). Parse it
+     * and kick the DERP I/O task if it has not connected yet. */
+    if (parse_derp_map_from_response(ml, update_json) && !ml->derp.connected) {
+        ESP_LOGI(TAG, "DERPMap arrived via long-poll - signaling DERP connect");
+        xEventGroupSetBits(ml->events, ML_EVT_DERP_CONNECT_REQ);
+    }
+}
+
+/* Append one stream-5 DATA payload to the long-poll reassembly buffer.
+ * MUST be called for EVERY stream-5 DATA frame in a read, not just the last one:
+ * a single read can carry several, and keeping only the last leaves the
+ * accumulator starting mid-message, which then mis-reads JSON bytes as a length
+ * prefix. (Observed on hardware: "implausible message size 808333626" - that is
+ * the ASCII ":1.0" read as a little-endian uint32.) */
+static void lp_acc_append(microlink_t *ml, const uint8_t *data, size_t len) {
+    if (!data || len == 0) return;
+    if (!ml->lp_acc) {
+        /* +1: the drain loop NUL-terminates in place at ps[size], which is one
+         * past the last message byte. A message ending exactly at the buffer
+         * end would otherwise write one byte past the allocation, and `size`
+         * comes off the wire. */
+        ml->lp_acc = ml_psram_malloc(ML_JSON_BUFFER_SIZE + 1);
+        ml->lp_acc_len = 0;
+        if (!ml->lp_acc) return;
+    }
+    if (ml->lp_acc_len + len > ML_JSON_BUFFER_SIZE) {
+        ESP_LOGW(TAG, "long-poll accumulator would overflow (%u + %u) - resetting",
+                 (unsigned)ml->lp_acc_len, (unsigned)len);
+        ml->lp_acc_len = 0;
+    }
+    if (ml->lp_acc_len + len <= ML_JSON_BUFFER_SIZE) {
+        memcpy(ml->lp_acc + ml->lp_acc_len, data, len);
+        ml->lp_acc_len += len;
+    }
+}
+
 static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
     /* Use select() to check if data is available before blocking in recv */
     fd_set readfds;
@@ -2903,10 +2993,35 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
     struct timeval tv_recv = { .tv_sec = 2, .tv_usec = 0 };
     ml_setsockopt(ml_conn_sockfd(ml), SOL_SOCKET, SO_RCVTIMEO, &tv_recv, sizeof(tv_recv));
 
-    uint8_t *frame_buf = ml_psram_malloc(65536);
+    /* 65536 for the read itself, plus room for a carried partial frame in front
+     * of it. noise_recv() abandons a frame mid-stream if its plaintext exceeds
+     * the window it was given (it has already consumed the Noise header by
+     * then), so the window must never shrink below the largest plaintext the
+     * peer can send. Sizing the buffer this way keeps the recv window at a full
+     * 65536 no matter how much is carried. */
+    const size_t frame_cap = 65536 + ML_H2_MAX_FRAME_LEN + 9;
+    uint8_t *frame_buf = ml_psram_malloc(frame_cap);
     if (!frame_buf) return 0;
 
-    int frame_len = noise_recv(ml, noise, frame_buf, 65536);
+    /* Prepend bytes left over from the previous read. An H2 DATA frame whose
+     * payload straddles a read boundary used to be dropped outright by the
+     * `pos + f_len > frame_len` break below, so its head was lost and every
+     * byte after it was mis-parsed as the start of a new message. */
+    size_t carry = 0;
+    if (ml->h2_acc && ml->h2_acc_len > 0) {
+        carry = ml->h2_acc_len;
+        if (carry > frame_cap) carry = 0;      /* cannot happen; be safe */
+        if (carry) memcpy(frame_buf, ml->h2_acc, carry);
+        ml->h2_acc_len = 0;
+    }
+
+    int rcvd = noise_recv(ml, noise, frame_buf + carry, (int)(frame_cap - carry));
+    int frame_len = (rcvd > 0) ? rcvd + (int)carry : rcvd;
+
+    if (rcvd <= 0 && carry > 0) {
+        /* Nothing new this time - keep what we had for the next read. */
+        if (ml->h2_acc) { memcpy(ml->h2_acc, frame_buf, carry); ml->h2_acc_len = carry; }
+    }
 
     if (frame_len <= 0) {
         free(frame_buf);
@@ -2917,8 +3032,7 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
     }
 
     /* Extract DATA frame payload from H2 frames, track flow control */
-    uint8_t *json_data = NULL;
-    size_t json_data_len = 0;
+    bool proto_err = false;
     uint32_t total_data_bytes = 0;
     uint32_t data_stream_id = 0;
     int pos = 0;
@@ -2931,7 +3045,42 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
                              (frame_buf[pos + 7] << 8) | frame_buf[pos + 8];
         pos += 9;
 
-        if (pos + (int)f_len > frame_len) break;
+        /* A 24-bit length field can claim up to 16 MB, which can never be
+         * satisfied from a 64 KB read buffer: we would carry forever, shrink
+         * the read window to zero and stall until the watchdog fires. Treat an
+         * unsatisfiable frame as a protocol error. */
+        if (f_len > ML_H2_MAX_FRAME_LEN) {
+            ESP_LOGE(TAG, "H2 frame length %lu exceeds %d - framing is unrecoverable, "
+                          "dropping the session", (unsigned long)f_len, ML_H2_MAX_FRAME_LEN);
+            ml->h2_acc_len = 0;
+            ml->lp_acc_len = 0;
+            /* Do NOT fall through to the trailing-bytes carry below: `pos` is
+             * already past this frame's header and its payload is still in the
+             * buffer, so carrying it would re-inject the very bytes we just
+             * rejected and desync every subsequent read. Once H2 framing is
+             * lost there is no way back within the session - close it and let
+             * the coord state machine reconnect. */
+            proto_err = true;
+            break;
+        }
+
+        if (pos + (int)f_len > frame_len) {
+            /* Partial frame: stash the header AND the bytes we do have, so the
+             * next read completes it. Dropping it here is what desynchronised
+             * the message reader - see the h2_acc comment above. */
+            size_t start = (size_t)pos - 9;          /* include the 9-byte header */
+            size_t left  = (size_t)frame_len - start;
+            if (!ml->h2_acc) ml->h2_acc = ml_psram_malloc(65536);
+            if (ml->h2_acc && left <= 65536) {
+                memcpy(ml->h2_acc, frame_buf + start, left);
+                ml->h2_acc_len = left;
+            } else {
+                ESP_LOGW(TAG, "H2: cannot carry %u-byte partial frame - dropping",
+                         (unsigned)left);
+                if (ml->h2_acc) ml->h2_acc_len = 0;
+            }
+            break;
+        }
 
         if (f_type == 0x00) {  /* DATA frame */
             total_data_bytes += f_len;
@@ -2942,10 +3091,8 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
                  * stream-liveness clock the COORD_LONG_POLL watchdog reads. */
                 ml->ctrl_stream_rx_ms = ml_get_time_ms();
                 data_stream_id = f_stream;
-                if (f_len > 0) {
-                    json_data = frame_buf + pos;
-                    json_data_len = f_len;
-                }
+                /* Append EVERY stream-5 DATA frame - see lp_acc_append(). */
+                lp_acc_append(ml, frame_buf + pos, f_len);
             } else if (f_len > 0) {
                 /* Endpoint update response (stream 7+) — discard body */
                 ESP_LOGD(TAG, "H2 stream %lu DATA: %lu bytes (discarded)",
@@ -2968,6 +3115,18 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
         pos += f_len;
     }
 
+    /* A read can also end mid-HEADER (1-8 bytes of the 9-byte prefix). The loop
+     * above stops on `pos + 9 <= frame_len`, so those bytes would be dropped and
+     * desynchronise the stream exactly as a split payload does. Carry them too. */
+    if (!proto_err && pos < frame_len && ml->h2_acc_len == 0) {
+        size_t left = (size_t)frame_len - (size_t)pos;
+        if (!ml->h2_acc) ml->h2_acc = ml_psram_malloc(65536);
+        if (ml->h2_acc && left <= 65536) {
+            memcpy(ml->h2_acc, frame_buf + pos, left);
+            ml->h2_acc_len = left;
+        }
+    }
+
     /* Send HTTP/2 WINDOW_UPDATE to replenish flow control after receiving DATA.
      * Without this, the server's send window exhausts and the connection stalls.
      * Must send for BOTH connection-level (stream 0) AND stream-level. (v1 reference) */
@@ -2983,64 +3142,74 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
         noise_send(ml, noise, wu_buf, wu_len);
     }
 
-    if (!json_data || json_data_len == 0) {
-        /* Keepalive, SETTINGS, or PING frame - not an error */
-        free(frame_buf);
-        return 1;  /* Got data, reset watchdog */
-    }
-
-    /* Skip 4-byte length prefix if present */
-    char *parse_start = (char *)json_data;
-    size_t parse_len = json_data_len;
-    if (parse_len > 4 && parse_start[4] == '{') {
-        parse_start += 4;
-        parse_len -= 4;
-    }
-
-    char saved = parse_start[parse_len];
-    parse_start[parse_len] = '\0';
-
-    cJSON *update_json = cJSON_Parse(parse_start);
-    parse_start[parse_len] = saved;
-
-    if (update_json) {
-        ESP_LOGI(TAG, "Long-poll MapResponse update received");
-
-        /* Update VPN IP if present */
-        cJSON *node = cJSON_GetObjectItem(update_json, "Node");
-        if (node) {
-            cJSON *addresses = cJSON_GetObjectItem(node, "Addresses");
-            if (addresses && cJSON_GetArraySize(addresses) > 0) {
-                const char *addr = cJSON_GetArrayItem(addresses, 0)->valuestring;
-                if (addr) {
-                    unsigned a, b, c, d;
-                    if (sscanf(addr, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
-                        uint32_t new_ip = (a << 24) | (b << 16) | (c << 8) | d;
-                        if (new_ip != ml->vpn_ip) {
-                            ml->vpn_ip = new_ip;
-                            ESP_LOGI(TAG, "VPN IP updated via long-poll");
-                        }
-                    }
-                }
+    /* ---- Reassemble and drain complete messages ---------------------------------------------
+     * Framing per tailscale/control/controlclient/direct.go:1304-1311:
+     *     var siz [4]byte; io.ReadFull(body, siz[:])
+     *     size := binary.LittleEndian.Uint32(siz[:])
+     *     msg := make([]byte, size); io.ReadFull(body, msg)
+     * i.e. a 4-byte LITTLE-ENDIAN length followed by exactly that many bytes. The reference is a
+     * framed reader by construction and cannot half-read a message; this makes ours one too.
+     *
+     * Previously this function pointed at whichever stream-5 DATA frame happened to be last in one
+     * read, so any MapResponse spanning more than one frame failed cJSON_Parse and was dropped
+     * SILENTLY - with ctrl_stream_rx_ms already stamped above, so every liveness signal stayed green
+     * while netmap updates were lost. Compression is disabled (Compress: ""), so responses arrive at
+     * full size and spanning is the normal case for anything but a keepalive. */
+    if (ml->lp_acc && ml->lp_acc_len >= 4) {
+        size_t consumed = 0;
+        for (;;) {
+            size_t avail = ml->lp_acc_len - consumed;
+            if (avail < 4) break;
+            uint8_t *m = ml->lp_acc + consumed;
+            uint32_t size = (uint32_t)m[0] | ((uint32_t)m[1] << 8) |
+                            ((uint32_t)m[2] << 16) | ((uint32_t)m[3] << 24);
+            /* Must be `- 4`: the accumulator holds ML_JSON_BUFFER_SIZE bytes and
+             * a message occupies 4 + size, so anything larger can never complete
+             * and would churn the buffer forever. */
+            if (size == 0 || size > ML_JSON_BUFFER_SIZE - 4) {
+                /* An unsatisfiable size means the length-prefixed stream is out
+                 * of frame. Discarding the buffer does NOT realign it - the next
+                 * read still lands mid-message while ctrl_stream_rx_ms keeps
+                 * getting stamped, so the node would sit wedged with every
+                 * liveness signal green. Same reasoning as the oversized-H2
+                 * guard above: once framing is lost there is no recovery within
+                 * the session - close it and let the coord state machine
+                 * reconnect. */
+                ESP_LOGE(TAG, "long-poll: implausible message size %lu ('%c%c%c%c') - "
+                              "stream out of frame, dropping the session (%u buffered bytes)",
+                         (unsigned long)size,
+                         isprint(m[0]) ? m[0] : '.', isprint(m[1]) ? m[1] : '.',
+                         isprint(m[2]) ? m[2] : '.', isprint(m[3]) ? m[3] : '.',
+                         (unsigned)ml->lp_acc_len);
+                ml->lp_acc_len = 0;
+                ml->h2_acc_len = 0;
+                consumed = 0;
+                proto_err = true;
+                break;
             }
+            if (avail < 4 + (size_t)size) break;   /* incomplete - keep for the next read */
+
+            char *ps = (char *)m + 4;
+            char saved = ps[size];
+            ps[size] = '\0';
+            cJSON *update_json = cJSON_Parse(ps);
+            ps[size] = saved;
+            if (update_json) {
+                apply_long_poll_map(ml, update_json);
+                cJSON_Delete(update_json);
+            } else {
+                ESP_LOGW(TAG, "long-poll: %lu-byte message failed to parse", (unsigned long)size);
+            }
+            consumed += 4 + size;
         }
-
-        /* Parse peer updates */
-        parse_peers_from_map_response(ml, update_json);
-
-        /* The DERPMap can arrive on the stream too — Headscale >= 0.26
-         * delivers the ENTIRE initial netmap here (the non-streaming fetch
-         * returns an empty body, see do_map_exchange).  Parse it and kick
-         * the DERP I/O task if it has not connected yet. */
-        if (parse_derp_map_from_response(ml, update_json) && !ml->derp.connected) {
-            ESP_LOGI(TAG, "DERPMap arrived via long-poll — signaling DERP connect");
-            xEventGroupSetBits(ml->events, ML_EVT_DERP_CONNECT_REQ);
+        if (consumed > 0 && consumed <= ml->lp_acc_len) {
+            memmove(ml->lp_acc, ml->lp_acc + consumed, ml->lp_acc_len - consumed);
+            ml->lp_acc_len -= consumed;
         }
-
-        cJSON_Delete(update_json);
     }
 
     free(frame_buf);
+    if (proto_err) return -1;   /* caller closes the connection and reconnects */
     return 1;
 }
 

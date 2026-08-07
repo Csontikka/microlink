@@ -366,6 +366,10 @@ typedef struct {
  * DERP Map Types (parsed from MapResponse, used by coord + STUN)
  * ========================================================================== */
 
+/* Largest HTTP/2 frame we will attempt to reassemble. The wire field is 24-bit
+ * (16 MB); anything beyond what fits in one read buffer can never complete. */
+#define ML_H2_MAX_FRAME_LEN     32768
+
 #define ML_MAX_DERP_REGIONS     32
 #define ML_MAX_DERP_NODES       4
 
@@ -578,6 +582,19 @@ struct microlink_s {
      * "offline" in the admin console for hours, device thinks all is well.
      * The COORD_LONG_POLL stream watchdog reconnects off this clock. */
     volatile uint64_t ctrl_stream_rx_ms;
+
+    /* Long-poll MapResponse reassembly buffer. The streamed map session is length-prefixed; see
+     * tailscale/control/controlclient/direct.go:1304-1311, which reads a 4-byte LITTLE-ENDIAN size
+     * and then exactly that many bytes. A message can span several H2 DATA frames and several Noise
+     * frames, so the reader must accumulate — do_map_exchange already does, for the reason its own
+     * comment gives ("a single H2 frame can span multiple Noise frames"); the long-poll path did not. */
+    /* HTTP/2 frame reassembly for the long-poll socket. A DATA frame whose
+     * payload is split across two reads must be completed, not dropped. */
+    uint8_t *h2_acc;
+    size_t   h2_acc_len;
+
+    uint8_t *lp_acc;         /* PSRAM, ML_JSON_BUFFER_SIZE, lazily allocated */
+    size_t   lp_acc_len;
 
     /* Key expiry (parsed from MapResponse self-node) */
     int64_t key_expiry_epoch;       /* Unix epoch seconds, 0 = no expiry */
