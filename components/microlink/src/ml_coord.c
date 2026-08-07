@@ -2883,7 +2883,11 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
         if (f_type == 0x00) {  /* DATA frame */
             total_data_bytes += f_len;
             if (f_stream == 5) {
-                /* Long-poll MapResponse data (stream 5) — parse as JSON */
+                /* Long-poll MapResponse data (stream 5) — parse as JSON.
+                 * Any DATA here (incl. the ~60 s mapSession keepalives) is
+                 * proof the server-side mapSession is alive: feed the
+                 * stream-liveness clock the COORD_LONG_POLL watchdog reads. */
+                ml->ctrl_stream_rx_ms = ml_get_time_ms();
                 data_stream_id = f_stream;
                 if (f_len > 0) {
                     json_data = frame_buf + pos;
@@ -3135,8 +3139,6 @@ void ml_coord_task(void *arg) {
                     break;
                 }
 
-                xEventGroupSetBits(ml->events, ML_EVT_COORD_REGISTERED);
-
                 if (fp_rc == 1) {
                     /* Empty fetch response (Headscale >= 0.26): the initial
                      * netmap — Node, peers AND DERPMap — is only delivered
@@ -3157,6 +3159,16 @@ void ml_coord_task(void *arg) {
                         ESP_LOGW(TAG, "No initial netmap on the long-poll stream yet");
                     }
                 }
+
+                /* Signal registration only now — the wg_mgr task wakes on
+                 * this bit and immediately snapshots ml->vpn_ip into the WG
+                 * netif address. On the streamed-netmap path (Headscale >=
+                 * 0.26) the VPN IP is only known after the stream read
+                 * above; signalling before it left the netif on the temp
+                 * 100.64.0.1 forever, and a netif whose address never
+                 * matches the real tailnet IP silently drops every inbound
+                 * packet (all TCP dead while DISCO keeps answering). */
+                xEventGroupSetBits(ml->events, ML_EVT_COORD_REGISTERED);
 
                 if (!ml->derp.connected) {
                     /* Signal DERP I/O task to connect (connection now owned by I/O task) */
@@ -3197,9 +3209,11 @@ void ml_coord_task(void *arg) {
             ml->connected_at_ms = ml_get_time_ms();
             reconnect_attempts = 0;
             last_activity_ms = ml->connected_at_ms;
-            /* Seed the server-RX freshness clock at (re)connect; from here it
-             * only advances on genuine inbound frames (see poll_map_update). */
+            /* Seed the server-RX freshness clocks at (re)connect; from here
+             * they only advance on genuine inbound frames (see
+             * poll_map_update). */
             ml->ctrl_last_rx_ms = ml->connected_at_ms;
+            ml->ctrl_stream_rx_ms = ml->connected_at_ms;
 
             /* Notify app */
             if (ml->state_cb) {
@@ -3214,6 +3228,24 @@ void ml_coord_task(void *arg) {
                 /* Check control plane watchdog (120s) */
                 if (now - last_activity_ms > ml->t_ctrl_watchdog_ms) {
                     ESP_LOGW(TAG, "Control plane watchdog timeout");
+                    state = COORD_RECONNECTING;
+                    break;
+                }
+
+                /* Stream-liveness watchdog (#32). The transport can look
+                 * perfectly healthy — the server's HTTP/2 front end keeps
+                 * ACKing our 5 s PINGs, resetting last_activity_ms — while
+                 * the server-side mapSession is silently gone: the admin
+                 * console shows the node offline, netmap updates stop, new
+                 * peers can't reach us, and existing tunnels keep working
+                 * so nothing else notices. The mapSession itself sends a
+                 * KeepAlive MapResponse roughly every minute, so prolonged
+                 * stream-5 silence means the session is dead regardless of
+                 * transport health — reconnect (full re-register, ~40 s). */
+                if (now - ml->ctrl_stream_rx_ms > ML_CTRL_STREAM_STALE_MS) {
+                    ESP_LOGW(TAG, "Control-plane map stream silent for %lu s — "
+                                  "mapSession presumed dead, reconnecting",
+                             (unsigned long)((now - ml->ctrl_stream_rx_ms) / 1000));
                     state = COORD_RECONNECTING;
                     break;
                 }
