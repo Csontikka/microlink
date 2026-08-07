@@ -652,6 +652,7 @@ void ml_derp_tx_task(void *arg) {
                         connected_since_ms = ml_get_time_ms();
                         verbose_phase = true;
                     } else {
+                        ml->rc_derp_retry++;
                         derp_backoff_ms *= 2;
                         if (derp_backoff_ms > ML_DERP_RETRY_MAX_MS) {
                             derp_backoff_ms = ML_DERP_RETRY_MAX_MS;
@@ -677,6 +678,7 @@ void ml_derp_tx_task(void *arg) {
             loop_start - ml->derp.last_recv_ms > ML_DERP_STALE_MS) {
             ESP_LOGW(TAG, "DERP RX silent for %lu s — relay presumed dead, reconnecting",
                      (unsigned long)((loop_start - ml->derp.last_recv_ms) / 1000));
+            ml->rc_derp_rx_wd++;
             xEventGroupSetBits(ml->events, ML_EVT_DERP_RECONNECT);
             continue;
         }

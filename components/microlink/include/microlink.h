@@ -267,6 +267,14 @@ typedef struct {
      * the Headscale node list without dumping the full key. */
     bool     identity_persistent;
     char     identity_pubkey_prefix[17];
+
+    /* Reconnect-cause counters since boot. Kept separate per detector so a
+     * fleet can tell watchdog saves from ordinary transport flaps (a single
+     * combined count overcounts — esphome-tailscale#32 lesson). */
+    uint32_t rc_coord_stream_wd;  /* control-plane map-stream watchdog fired */
+    uint32_t rc_coord_transport;  /* established coord session died (transport) */
+    uint32_t rc_derp_rx_wd;       /* DERP RX-liveness watchdog fired */
+    uint32_t rc_derp_retry;       /* failed DERP connect attempts (backoff ladder) */
 } microlink_diag_t;
 
 esp_err_t microlink_get_diag(const microlink_t *ml, microlink_diag_t *out);

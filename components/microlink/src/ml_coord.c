@@ -3450,6 +3450,7 @@ void ml_coord_task(void *arg) {
                 /* Check control plane watchdog (120s) */
                 if (now - last_activity_ms > ml->t_ctrl_watchdog_ms) {
                     ESP_LOGW(TAG, "Control plane watchdog timeout");
+                    ml->rc_coord_transport++;
                     state = COORD_RECONNECTING;
                     break;
                 }
@@ -3468,6 +3469,7 @@ void ml_coord_task(void *arg) {
                     ESP_LOGW(TAG, "Control-plane map stream silent for %lu s — "
                                   "mapSession presumed dead, reconnecting",
                              (unsigned long)((now - ml->ctrl_stream_rx_ms) / 1000));
+                    ml->rc_coord_stream_wd++;
                     state = COORD_RECONNECTING;
                     break;
                 }
@@ -3662,6 +3664,7 @@ void ml_coord_task(void *arg) {
                         last_activity_ms = now;
                     } else {
                         ESP_LOGW(TAG, "H2 PING send failed, reconnecting");
+                        ml->rc_coord_transport++;
                         state = COORD_RECONNECTING;
                         break;
                     }
@@ -3679,6 +3682,7 @@ void ml_coord_task(void *arg) {
                     ml->ctrl_last_rx_ms = now;
                 } else if (poll_ret < 0) {
                     ESP_LOGW(TAG, "Long-poll connection lost");
+                    ml->rc_coord_transport++;
                     state = COORD_RECONNECTING;
                     break;
                 }

@@ -458,6 +458,16 @@ struct microlink_s {
     int  register_user_id;
     char register_user_name[48];
 
+    /* Reconnect-cause counters (per boot; exported via microlink_diag_t so
+     * telemetry can ship them). A single undifferentiated "connect count"
+     * overcounts as a health signal — ordinary transport drops look the
+     * same as watchdog saves (esphome-tailscale#32 field verification) —
+     * so each detector counts separately. */
+    volatile uint32_t rc_coord_stream_wd;  /* map-stream watchdog fired */
+    volatile uint32_t rc_coord_transport;  /* established coord session died (ctrl watchdog / PING send / recv) */
+    volatile uint32_t rc_derp_rx_wd;       /* DERP RX-liveness watchdog fired */
+    volatile uint32_t rc_derp_retry;       /* failed DERP connect attempts on the backoff ladder */
+
     /* Event group (cross-task synchronization) */
     EventGroupHandle_t events;
 
