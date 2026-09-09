@@ -1048,9 +1048,9 @@ static void disco_send_ping_to_peer(microlink_t *ml, int peer_idx, bool force) {
      * DERP pong stealing the probe match from the direct pong. */
     if (!p->has_direct_path || !direct_sent) {
         ml_derp_queue_send(ml, p->public_key, pkt, pkt_len);
-        ESP_LOGI(TAG, "DISCO PING -> %s via DERP", p->hostname);
+        ESP_LOGD(TAG, "DISCO PING -> %s via DERP", p->hostname);
     } else {
-        ESP_LOGI(TAG, "DISCO PING -> %s via direct %d.%d.%d.%d:%d",
+        ESP_LOGD(TAG, "DISCO PING -> %s via direct %d.%d.%d.%d:%d",
                  p->hostname,
                  (int)((p->best_ip >> 24) & 0xFF), (int)((p->best_ip >> 16) & 0xFF),
                  (int)((p->best_ip >> 8) & 0xFF), (int)(p->best_ip & 0xFF),
@@ -1077,7 +1077,7 @@ static void process_disco_ping(microlink_t *ml, const ml_rx_packet_t *pkt,
 
     ml_peer_t *p = &ml->peers[peer_idx];
 
-    ESP_LOGI(TAG, "DISCO PING from %s (via %s)",
+    ESP_LOGD(TAG, "DISCO PING from %s (via %s)",
              p->hostname, pkt->via_derp ? "DERP" : "direct");
 
     /* Build PONG */
@@ -1157,7 +1157,7 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
         ml_peer_t *p = &ml->peers[peer_idx];
         uint64_t rtt_ms = now - pending_probes[i].sent_ms;
 
-        ESP_LOGI(TAG, "DISCO PONG from %s: RTT=%llu ms (via %s)",
+        ESP_LOGD(TAG, "DISCO PONG from %s: RTT=%llu ms (via %s)",
                  p->hostname, (unsigned long long)rtt_ms,
                  pkt->via_derp ? "DERP" : "direct");
 
@@ -1247,7 +1247,7 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
                         }
                     }
                 } else {
-                    ESP_LOGI(TAG, "WG endpoint stored (no session): %d.%d.%d.%d:%d for %s",
+                    ESP_LOGD(TAG, "WG endpoint stored (no session): %d.%d.%d.%d:%d for %s",
                              (int)((pkt->src_ip >> 24) & 0xFF), (int)((pkt->src_ip >> 16) & 0xFF),
                              (int)((pkt->src_ip >> 8) & 0xFF), (int)(pkt->src_ip & 0xFF),
                              (int)pkt->src_port, p->hostname);
@@ -1308,7 +1308,7 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
     /* Verify DISCO magic */
     if (memcmp(pkt->data, DISCO_MAGIC, 6) != 0) return;
 
-    ESP_LOGI(TAG, "DISCO RX: %d bytes via %s, disco_key=%02x%02x%02x%02x",
+    ESP_LOGD(TAG, "DISCO RX: %d bytes via %s, disco_key=%02x%02x%02x%02x",
              (int)pkt->len, pkt->via_derp ? "DERP" : "direct",
              pkt->data[6], pkt->data[7], pkt->data[8], pkt->data[9]);
 
@@ -1371,7 +1371,7 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
             size_t ep_data_len = plaintext_len - 2;
             int ep_count = ep_data_len / 18;
 
-            ESP_LOGI(TAG, "CallMeMaybe from %s: %d endpoints (udp_path=%d, at_sock=%d)",
+            ESP_LOGD(TAG, "CallMeMaybe from %s: %d endpoints (udp_path=%d, at_sock=%d)",
                      ml->peers[peer_idx].hostname, ep_count,
                      disco_has_udp_path(ml), ml_at_socket_is_ready());
 
@@ -1394,7 +1394,7 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
                 }
                 if (entry[10] != 0xff || entry[11] != 0xff) is_v4_mapped = false;
 
-                ESP_LOGI(TAG, "  CMM ep[%d]: v4mapped=%d port=%d bytes=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+                ESP_LOGD(TAG, "  CMM ep[%d]: v4mapped=%d port=%d bytes=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
                          i, is_v4_mapped, port,
                          entry[0], entry[1], entry[2], entry[3],
                          entry[4], entry[5], entry[6], entry[7],
@@ -1416,7 +1416,7 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
 
                     if (ping_len > 0) {
                         int ret = disco_udp_sendto(ml, ping_pkt, ping_len, ip, port);
-                        ESP_LOGI(TAG, "CMM probe -> %d.%d.%d.%d:%d (%d bytes, ret=%d)",
+                        ESP_LOGD(TAG, "CMM probe -> %d.%d.%d.%d:%d (%d bytes, ret=%d)",
                                  (int)((ip >> 24) & 0xFF), (int)((ip >> 16) & 0xFF),
                                  (int)((ip >> 8) & 0xFF), (int)(ip & 0xFF),
                                  (int)port, (int)ping_len, ret);
@@ -1528,7 +1528,7 @@ static void disco_send_call_me_maybe(microlink_t *ml, int peer_idx) {
                 plaintext[pt_len++] = local_port & 0xFF;
                 ep_count++;
 
-                ESP_LOGI(TAG, "CMM endpoint: LAN %lu.%lu.%lu.%lu:%u",
+                ESP_LOGD(TAG, "CMM endpoint: LAN %lu.%lu.%lu.%lu:%u",
                          (unsigned long)((local_ip >> 24) & 0xFF),
                          (unsigned long)((local_ip >> 16) & 0xFF),
                          (unsigned long)((local_ip >> 8) & 0xFF),
@@ -1553,7 +1553,7 @@ static void disco_send_call_me_maybe(microlink_t *ml, int peer_idx) {
         plaintext[pt_len++] = pub_port & 0xFF;
         ep_count++;
 
-        ESP_LOGI(TAG, "CMM endpoint: STUN %lu.%lu.%lu.%lu:%u",
+        ESP_LOGD(TAG, "CMM endpoint: STUN %lu.%lu.%lu.%lu:%u",
                  (unsigned long)((pub_ip >> 24) & 0xFF),
                  (unsigned long)((pub_ip >> 16) & 0xFF),
                  (unsigned long)((pub_ip >> 8) & 0xFF),
@@ -1585,7 +1585,7 @@ static void disco_send_call_me_maybe(microlink_t *ml, int peer_idx) {
     /* Send via DERP */
     esp_err_t err = ml_derp_queue_send(ml, p->public_key, pkt, pos);
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "CallMeMaybe sent to %s (%d endpoints)", p->hostname, ep_count);
+        ESP_LOGD(TAG, "CallMeMaybe sent to %s (%d endpoints)", p->hostname, ep_count);
     } else {
         ESP_LOGW(TAG, "CallMeMaybe send failed for %s: %d", p->hostname, err);
     }
@@ -2011,7 +2011,30 @@ void ml_wg_mgr_task(void *arg) {
     bool derp_was_connected = false;
     bool stun_cmm_sent = false;  /* One-shot: send CMMs after first STUN result */
 
+    /* Per-iteration work budget (#46). This task runs at priority 7 on the
+     * same core as the host application's main loop (ESPHome loopTask is
+     * priority 1 on core 1). The queue drains below used to run until the
+     * queues were empty and only then sleep 10 ms; under a sustained DISCO
+     * exchange (a peer that keeps probing because its WireGuard session never
+     * completes) packets arrived faster than one X25519 decrypt + reply, the
+     * drains never ended, and the priority-1 loop got no CPU for >5 s --
+     * the task watchdog then aborted the whole device. Now each iteration
+     * processes at most a burst of packets within a time budget and ALWAYS
+     * reaches the 10 ms sleep, so lower-priority tasks are guaranteed a
+     * share of the core no matter how hard a peer pushes. Excess packets
+     * simply wait in the queue for the next iteration (DISCO is lossy by
+     * design; the queues are bounded and net_io drops on overflow). */
+    #define WG_MGR_ITER_BUDGET_MS   40
+    #define WG_MGR_DISCO_BURST      8
+    #define WG_MGR_WG_BURST         32
+    uint32_t disco_rx_10s = 0;          /* DISCO packets processed, per 10 s summary */
+    uint32_t budget_hits_10s = 0;       /* iterations that hit the burst/time budget with work left */
+    uint64_t iter_start_ms = 0;
+    #define WG_MGR_BUDGET_LEFT() ((ml_get_time_ms() - iter_start_ms) < WG_MGR_ITER_BUDGET_MS)
+
     while (!(xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST)) {
+        iter_start_ms = ml_get_time_ms();
+
         /* Process peer updates from coord task */
         process_peer_updates(ml);
 
@@ -2052,7 +2075,8 @@ void ml_wg_mgr_task(void *arg) {
         {
             uint8_t tail = __atomic_load_n(&ml->zc.rx_tail, __ATOMIC_RELAXED);
             uint8_t head = __atomic_load_n(&ml->zc.rx_head, __ATOMIC_ACQUIRE);
-            while (tail != head) {
+            int zc_n = 0;
+            while (tail != head && zc_n++ < WG_MGR_DISCO_BURST && WG_MGR_BUDGET_LEFT()) {
                 ml_zc_disco_entry_t *entry = &ml->zc.rx_ring[tail];
                 ml_rx_packet_t disco_pkt = {
                     .data = entry->data,
@@ -2062,6 +2086,7 @@ void ml_wg_mgr_task(void *arg) {
                     .via_derp = false,
                 };
                 process_disco_packet(ml, &disco_pkt);
+                disco_rx_10s++;
                 /* Don't free — data is in the ring buffer, not heap-allocated */
                 tail = (tail + 1) % ML_ZC_DISCO_RING_SIZE;
                 head = __atomic_load_n(&ml->zc.rx_head, __ATOMIC_ACQUIRE);
@@ -2071,14 +2096,18 @@ void ml_wg_mgr_task(void *arg) {
 #endif
         /* Queue-based path: DISCO from DERP relay + fallback when zero-copy disabled */
         ml_rx_packet_t disco_pkt;
-        while (xQueueReceive(ml->disco_rx_queue, &disco_pkt, 0) == pdTRUE) {
+        for (int n = 0; n < WG_MGR_DISCO_BURST && WG_MGR_BUDGET_LEFT() &&
+                        xQueueReceive(ml->disco_rx_queue, &disco_pkt, 0) == pdTRUE; n++) {
             process_disco_packet(ml, &disco_pkt);
             free(disco_pkt.data);
+            disco_rx_10s++;
         }
+        if (uxQueueMessagesWaiting(ml->disco_rx_queue) > 0) budget_hits_10s++;
 
         /* Process WireGuard packets */
         ml_rx_packet_t wg_pkt;
-        while (xQueueReceive(ml->wg_rx_queue, &wg_pkt, 0) == pdTRUE) {
+        for (int n = 0; n < WG_MGR_WG_BURST && WG_MGR_BUDGET_LEFT() &&
+                        xQueueReceive(ml->wg_rx_queue, &wg_pkt, 0) == pdTRUE; n++) {
             process_wg_packet(ml, &wg_pkt);
         }
 
@@ -2118,21 +2147,36 @@ void ml_wg_mgr_task(void *arg) {
          * slow crypto/probe paths; without this second drain, download frames
          * pile up in wg_rx_queue and overflow (→ DERP-RX drops → TCP backoff →
          * the sustained rate falls well below the burst peak) while the task
-         * was busy. 2026-05-27. */
-        while (xQueueReceive(ml->wg_rx_queue, &wg_pkt, 0) == pdTRUE) {
+         * was busy. 2026-05-27. Bounded like the first drain (#46). */
+        for (int n = 0; n < WG_MGR_WG_BURST && WG_MGR_BUDGET_LEFT() &&
+                        xQueueReceive(ml->wg_rx_queue, &wg_pkt, 0) == pdTRUE; n++) {
             process_wg_packet(ml, &wg_pkt);
         }
 
         /* Throughput-collapse diag: full state snapshot every 10 s. */
         if (now - last_snapshot_ms >= 10000) {
             dump_wg_state_snapshot(ml);
+            /* One line per 10 s instead of 2-10 lines per packet: keeps a
+             * DISCO storm visible (and attributable to the budget) at INFO
+             * without the per-packet logging that helped starve the host
+             * loop in the first place (#46). */
+            if (disco_rx_10s > 0) {
+                ESP_LOGI(TAG, "DISCO: %lu packets in 10 s (%lu.%lu/s), %lu iterations budget-capped",
+                         (unsigned long)disco_rx_10s, (unsigned long)(disco_rx_10s / 10),
+                         (unsigned long)(disco_rx_10s % 10), (unsigned long)budget_hits_10s);
+            }
+            disco_rx_10s = 0;
+            budget_hits_10s = 0;
             last_snapshot_ms = now;
         }
 
         /* Yield - 10ms loop rate for minimum packet processing latency.
-         * Each wake is cheap: queue check + event bits check, no crypto. */
+         * Each wake is cheap: queue check + event bits check, no crypto.
+         * This sleep is what hands the core to lower-priority tasks; the
+         * budgets above guarantee it is reached every iteration (#46). */
         vTaskDelay(pdMS_TO_TICKS(10));
     }
+    #undef WG_MGR_BUDGET_LEFT
 
     /* Shutdown WireGuard interface */
     if (ml->wg_netif) {

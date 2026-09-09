@@ -328,7 +328,7 @@ static void dispatch_derp_frame(microlink_t *ml, uint8_t frame_type,
     switch (frame_type) {
     case DERP_FRAME_RECV_PACKET:
         if (payload) {
-            ESP_LOGI(TAG, "DERP RecvPacket: %d bytes from %02x%02x%02x%02x, hdr=%02x",
+            ESP_LOGD(TAG, "DERP RecvPacket: %d bytes from %02x%02x%02x%02x, hdr=%02x",
                      (int)payload_len,
                      src_key[0], src_key[1], src_key[2], src_key[3],
                      payload_len > 0 ? payload[0] : 0xFF);
