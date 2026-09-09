@@ -615,6 +615,7 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     p->trust_until_ms = 0;
     p->last_send_ms = 0;
     p->last_cmm_rx_ms = 0;
+    p->best_last_pong_ms = 0;
     p->disco_shared_valid = false;
     p->last_upgrade_ms = 0;
     p->has_direct_path = false;
@@ -1213,10 +1214,35 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
 
         p->last_pong_recv_ms = now;
 
-        /* If direct reply, update best path */
+        /* If direct reply, update best path -- but stick to the current one
+         * while it still answers. A peer can answer from two addresses (its
+         * LAN address and its public NAT mapping are both in the netmap and
+         * both get our ping; a NAT may also flip ports), and following every
+         * PONG made best_ip/best_port flap between them; with no data
+         * flowing, every flap forced a WireGuard handshake below (measured:
+         * one per 3 s toward such a peer). The reference client keeps
+         * bestAddr while it is trusted (trustUDPAddrDuration, 6.5 s) and
+         * only moves on clearly better latency; without per-endpoint
+         * latency here the rule is: keep the best while it answered within
+         * that window, let another address take over once it went quiet. */
+        if (!pkt->via_derp && pkt->src_ip != 0 && p->has_direct_path &&
+            (p->best_ip != pkt->src_ip || p->best_port != pkt->src_port) &&
+            (now - p->best_last_pong_ms) < ML_DISCO_BEST_STICKY_MS) {
+            ESP_LOGD(TAG, "PONG from %s via %d.%d.%d.%d:%d, keeping best %d.%d.%d.%d:%d (answered %llu ms ago)",
+                     p->hostname,
+                     (int)((pkt->src_ip >> 24) & 0xFF), (int)((pkt->src_ip >> 16) & 0xFF),
+                     (int)((pkt->src_ip >> 8) & 0xFF), (int)(pkt->src_ip & 0xFF), (int)pkt->src_port,
+                     (int)((p->best_ip >> 24) & 0xFF), (int)((p->best_ip >> 16) & 0xFF),
+                     (int)((p->best_ip >> 8) & 0xFF), (int)(p->best_ip & 0xFF), (int)p->best_port,
+                     (unsigned long long)(now - p->best_last_pong_ms));
+            pending_probes[i].active = false;
+            matched = true;
+            break;
+        }
         if (!pkt->via_derp && pkt->src_ip != 0) {
             p->best_ip = pkt->src_ip;
             p->best_port = pkt->src_port;
+            p->best_last_pong_ms = now;
             p->has_direct_path = true;
             p->trust_until_ms = now + ML_DISCO_TRUST_DURATION_MS;
             /* Phase 1.5g — a direct PONG arrived; clear the DERP-only flag so
@@ -1287,9 +1313,22 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
                                      (int)cur_port, (int)pkt->src_port,
                                      (unsigned)last_rx_age_ms);
                         } else {
-                            wireguardif_connect(netif, (u8_t)p->wg_peer_index);
-                            ESP_LOGI(TAG, "WG endpoint SWITCHED to direct: %d.%d.%d.%d:%d for %s "
-                                          "(last_rx=%ums, forcing handshake)",
+                            /* No data lately either -- still no reason for a
+                             * handshake. WireGuard authenticates by key and
+                             * roams by design: the existing keypair keeps
+                             * working at the new address, and a peer that
+                             * really lost the session is caught by the WG
+                             * timers and by the DERP retry above (up != OK).
+                             * The forced handshake that used to sit here
+                             * fought wireguardif's own roaming on a
+                             * dual-homed peer -- DISCO's best said one of its
+                             * addresses, its WireGuard packets arrived from
+                             * the other, so the endpoint changed on every
+                             * heartbeat and re-handshaked every 3 s for ever.
+                             * The reference client never handshakes on an
+                             * endpoint change. */
+                            ESP_LOGD(TAG, "WG endpoint re-pointed to direct: %d.%d.%d.%d:%d for %s "
+                                          "(last_rx=%ums, session kept)",
                                      (int)((pkt->src_ip >> 24) & 0xFF), (int)((pkt->src_ip >> 16) & 0xFF),
                                      (int)((pkt->src_ip >> 8) & 0xFF), (int)(pkt->src_ip & 0xFF),
                                      (int)pkt->src_port, p->hostname,
