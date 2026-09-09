@@ -125,6 +125,13 @@ extern "C" {
 #define ML_DISCO_PING_TIMEOUT_MS        5000
 #define ML_DISCO_UPGRADE_INTERVAL_MS    15000
 #define ML_DISCO_SESSION_ACTIVE_MS      45000
+/* Per-peer DISCO backoff (esphome-tailscale#46, direction 3). The reference
+ * client heartbeats a peer only while it has traffic for it
+ * (sessionActiveTimeout) and never answers a CallMeMaybe with one of its own.
+ * microlink used to heartbeat every peer with a direct path every 3 s for
+ * ever and to echo every CallMeMaybe, so two microlink nodes that never
+ * completed a WireGuard session kept each other busy indefinitely. */
+#define ML_DISCO_CMM_BURST_FLOOR_MS     2500    /* min spacing of CallMeMaybe-triggered ping bursts, per peer */
 
 /* STUN servers (Tailscale primary, Google fallback) */
 #define ML_STUN_PRIMARY_HOST    "derp9.tailscale.com"
@@ -325,6 +332,7 @@ typedef struct {
     uint64_t trust_until_ms;        /* Direct path trusted until */
     uint64_t last_send_ms;          /* Last data sent to this peer */
     uint64_t last_upgrade_ms;       /* Last path upgrade attempt */
+    uint64_t last_cmm_rx_ms;        /* Last CallMeMaybe-triggered ping burst (floor) */
 
     /* Best direct path */
     uint32_t best_ip;

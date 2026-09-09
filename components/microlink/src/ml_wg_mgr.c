@@ -600,6 +600,7 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     p->last_pong_recv_ms = 0;
     p->trust_until_ms = 0;
     p->last_send_ms = 0;
+    p->last_cmm_rx_ms = 0;
     p->last_upgrade_ms = 0;
     p->has_direct_path = false;
     p->best_ip = 0;
@@ -1103,6 +1104,15 @@ static void process_disco_ping(microlink_t *ml, const ml_rx_packet_t *pkt,
     ESP_LOGD(TAG, "DISCO PING from %s (via %s)",
              p->hostname, pkt->via_derp ? "DERP" : "direct");
 
+    /* Nothing is sent from here beyond the PONG below -- a PING must not
+     * trigger a PING, or two nodes chase each other. (The reference client
+     * also files the source as a candidate endpoint; that is deliberately
+     * not done here: without latency-based path selection a second
+     * answering address makes best_ip/best_port flap between the two and,
+     * with no data flowing, every flap forces a WireGuard handshake --
+     * observed with a NAT'd container peer whose pings leave from a port
+     * other than its listening one.) */
+
     /* Build PONG */
     uint8_t pong[256];
     size_t pong_len = 0;
@@ -1415,10 +1425,31 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
                      ml->peers[peer_idx].hostname, ep_count,
                      disco_has_udp_path(ml), ml_at_socket_is_ready());
 
-            /* Reply with our own CallMeMaybe (bidirectional NAT traversal).
-             * Skip on cellular: our endpoints are behind CGNAT and unreachable. */
-            if (!ml_at_socket_is_ready()) {
-                disco_send_call_me_maybe(ml, peer_idx);
+            /* No CallMeMaybe in reply. The reference client (magicsock
+             * handleCallMeMaybe) only pings the endpoints it was given; it
+             * sends its own CallMeMaybe when IT has traffic for us and no
+             * trusted direct path. microlink used to echo one back, so two
+             * microlink nodes without a WireGuard session bounced
+             * CallMeMaybe -> ping burst -> CallMeMaybe between each other for
+             * ever (esphome-tailscale#46: ~9 DISCO packets/s from one peer).
+             * The peer learns our address from the source of the pings below
+             * and from the PONGs we send to its own pings; we learn its from
+             * the PONGs to our probes of its netmap endpoints.
+             *
+             * Per-peer floor on the burst: a well-behaved peer sends at most
+             * one CallMeMaybe per heartbeat (3 s); faster than that is an
+             * older microlink echoing ours, and every probe below costs an
+             * X25519. A suppressed burst is simply dropped: the peer's next
+             * CallMeMaybe or our next probe round covers it. */
+            ml_peer_t *cp = &ml->peers[peer_idx];
+            uint64_t cmm_now = ml_get_time_ms();
+            bool burst_ok = (cp->last_cmm_rx_ms == 0) ||
+                            (cmm_now - cp->last_cmm_rx_ms >= ML_DISCO_CMM_BURST_FLOOR_MS);
+            if (burst_ok) {
+                cp->last_cmm_rx_ms = cmm_now;
+            } else {
+                ESP_LOGD(TAG, "CallMeMaybe burst from %s suppressed (%llu ms after the previous one)",
+                         cp->hostname, (unsigned long long)(cmm_now - cp->last_cmm_rx_ms));
             }
 
             /* Probe each endpoint with a DISCO ping.
@@ -1448,6 +1479,8 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
                               ((uint32_t)entry[14] << 8) |
                               (uint32_t)entry[15];
 
+                if (!burst_ok) continue;
+
                 /* Send DISCO ping to this endpoint */
                 if (disco_has_udp_path(ml)) {
                     uint8_t ping_pkt[256];
@@ -1467,7 +1500,9 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
             }
 
             /* Also force-ping peer's known endpoints from MapResponse */
-            disco_send_ping_to_peer(ml, peer_idx, true);
+            if (burst_ok) {
+                disco_send_ping_to_peer(ml, peer_idx, true);
+            }
         }
         break;
     default:
@@ -1816,17 +1851,25 @@ static void disco_periodic_probes(microlink_t *ml) {
                 } else {
                     /* Encrypted data ALSO stopped — the direct path is really
                      * dead. Fall back to DERP. */
-                    ESP_LOGI(TAG, "Direct path to %s expired (last_rx=%ums), "
-                                  "reverting to DERP", p->hostname,
-                             (unsigned)last_rx_age_ms);
+                    bool session_up = false;
                     if (ml->wg_netif && p->wg_peer_index >= 0) {
                         struct netif *netif = (struct netif *)ml->wg_netif;
-                        err_t is_up = wireguardif_peer_is_up(netif, (u8_t)p->wg_peer_index,
-                                                               NULL, NULL);
-                        if (is_up == ERR_OK) {
+                        session_up = (wireguardif_peer_is_up(netif, (u8_t)p->wg_peer_index,
+                                                             NULL, NULL) == ERR_OK);
+                        if (session_up) {
+                            ESP_LOGI(TAG, "Direct path to %s expired (last_rx=%ums), "
+                                          "reverting to DERP", p->hostname,
+                                     (unsigned)last_rx_age_ms);
                             wireguardif_connect_derp(netif, (u8_t)p->wg_peer_index);
                             ESP_LOGI(TAG, "  WG session active, falling back to DERP for %s", p->hostname);
                         }
+                    }
+                    if (!session_up) {
+                        /* No WireGuard session behind this path, nothing to
+                         * fall back: this is the once-a-minute re-probe of a
+                         * session-less peer (see the heartbeat gate below). */
+                        ESP_LOGD(TAG, "Direct path to %s (no WG session): re-probe after %u s",
+                                 p->hostname, (unsigned)(ML_DISCO_TRUST_DURATION_MS / 1000));
                     }
                     /* One force-ping to try re-establishing direct path. */
                     if (!ml_at_socket_is_ready()) {
@@ -1860,7 +1903,7 @@ static void disco_periodic_probes(microlink_t *ml) {
          * throughput case (keypair valid, DISCO pings starved) is likewise
          * untouched. The 30 s attempt cadence is uniform so PONGs that clear
          * derp_fallback_active can't make us re-fire faster than every 30 s. */
-        if (p->wg_peer_index >= 0 && ml->wg_netif &&
+        if (p->wg_peer_index >= 0 && ml->wg_netif && p->online &&
             now - p->peer_added_ms > 30000) {
             struct netif *netif = (struct netif *)ml->wg_netif;
             err_t up = wireguardif_peer_is_up(netif, (u8_t)p->wg_peer_index,
@@ -1882,7 +1925,14 @@ static void disco_periodic_probes(microlink_t *ml) {
         /* Probe for direct path upgrade (every UPGRADE_INTERVAL when on DERP).
          * Skip on cellular: direct paths impossible through carrier-grade NAT.
          * Throttled to DISCO_PROBES_PER_TICK to spread load and reduce jitter. */
-        if (!ml_at_socket_is_ready() && !p->has_direct_path &&
+        /* ... and not toward a peer the netmap marks offline: nobody answers,
+         * each probe still costs an X25519 plus a DERP send, and on a
+         * 13-peer router with 8 of them offline that alone kept every
+         * 1 s tick above the 30 ms SLOW mark. p->online is the netmap
+         * Node.Online tri-state (unknown => true), so this only skips peers
+         * the control plane has explicitly reported offline; the next
+         * PeersChanged delta that flips them back re-enables probing. */
+        if (!ml_at_socket_is_ready() && !p->has_direct_path && p->online &&
             now - p->last_upgrade_ms > ML_DISCO_UPGRADE_INTERVAL_MS) {
             if (upgrade_probes_sent < DISCO_PROBES_PER_TICK) {
                 disco_send_ping_to_peer(ml, i, false);
@@ -1894,10 +1944,27 @@ static void disco_periodic_probes(microlink_t *ml) {
         /* Heartbeat on active direct paths (every HEARTBEAT interval).
          * MUST use force=true because HEARTBEAT_MS (3s) < PING_INTERVAL_MS (5s),
          * so the rate limiter would always block heartbeat pings.
-         * Heartbeats are NEVER throttled — they're time-critical for trust_until_ms. */
+         * Heartbeats are NEVER throttled — they're time-critical for trust_until_ms.
+         *
+         * Only behind a WireGuard session, though. The reference client
+         * heartbeats a peer only while it has traffic for it
+         * (sessionActiveTimeout) and sends an idle one nothing; here the
+         * heartbeat protects the single data-plane endpoint of a live session,
+         * so it runs for as long as the session does, but a peer that never
+         * completed a handshake gets no heartbeat at all -- its address is
+         * refreshed once a minute by the trust-expiry re-probe above. Before
+         * this gate every session-less peer was pinged every 3 s for ever
+         * (esphome-tailscale#46, direction 3). */
         if (p->has_direct_path &&
             now - p->last_ping_sent_ms > ml->t_disco_heartbeat_ms) {
-            disco_send_ping_to_peer(ml, i, true);
+            bool session_up = false;
+            if (ml->wg_netif && p->wg_peer_index >= 0) {
+                session_up = (wireguardif_peer_is_up((struct netif *)ml->wg_netif,
+                                                     (u8_t)p->wg_peer_index, NULL, NULL) == ERR_OK);
+            }
+            if (session_up) {
+                disco_send_ping_to_peer(ml, i, true);
+            }
         }
     }
 
