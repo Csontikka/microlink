@@ -27,6 +27,9 @@ typedef struct microlink_s microlink_t;
 typedef struct {
     const char *auth_key;       /* Tailscale auth key (tskey-auth-...) */
     const char *device_name;    /* Device hostname on the tailnet */
+    const char *ipn_version;    /* Hostinfo.IPNVersion, version.Long() shape
+                                 * ("x.y.z-t<hash>-g<hash>"). NULL/empty = omit the
+                                 * field (report no client version). */
     bool enable_derp;           /* Enable DERP relay (default: true) */
     bool enable_stun;           /* Enable STUN endpoint discovery */
     bool enable_disco;          /* Enable DISCO NAT traversal */
@@ -252,10 +255,11 @@ typedef struct {
     int      peer_count;
     int      peer_online;       /* peers currently marked active */
     uint32_t uptime_sec;        /* seconds in ML_STATE_CONNECTED; 0 if not connected */
-    /* Last RegisterResponse User block — surfaces auth_key / stale-
-     * node-key failures that Headscale wraps in a 200-OK. Semantics:
+    /* Identity from the last RegisterResponse — display only, NOT a health
+     * signal (registration failures surface via RegisterResponse.Error and
+     * are logged). Semantics:
      *   -1 = no RegisterResponse parsed yet this boot,
-     *    0 = identity is bad (auth_key invalid or node-key unknown),
+     *    0 = registered with no bound user (auth-key or tag-owned) — normal,
      *   >0 = registered as a real user, name in register_user_name. */
     int      register_user_id;
     char     register_user_name[48];

@@ -1299,6 +1299,9 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     cJSON *hostinfo = cJSON_CreateObject();
     const char *dev_name = (ml->config.device_name && ml->config.device_name[0]) ? ml->config.device_name : microlink_default_device_name();
     cJSON_AddStringToObject(hostinfo, "Hostname", dev_name);
+    if (ml->config.ipn_version && ml->config.ipn_version[0]) {
+        cJSON_AddStringToObject(hostinfo, "IPNVersion", ml->config.ipn_version);
+    }
     cJSON_AddStringToObject(hostinfo, "OS", "linux");
     cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
     cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
@@ -1539,40 +1542,90 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     parse_start[parse_len] = saved;
     free(resp_buf);
 
-    /* Sanity-check the User block before anything else. Headscale will
-     * still 200 the Register call when the auth_key is bogus or the
-     * node-key was previously registered but the server-side record is
-     * gone — only the JSON betrays the truth (User.ID=0, empty
-     * DisplayName). Without surfacing it here, the first user-visible
-     * symptom is a "node not found" from the next MapRequest, which
-     * reads like a generic transport problem. */
+    /* Check the RegisterResponse status fields the reference client acts on.
+     *
+     * The status fields the reference ACTS ON (direct.go:883-931) are:
+     *
+     *   resp.Error          -> fatal; "if non-empty, other status fields
+     *                          should be ignored" (tailcfg.go:1359)
+     *   resp.NodeKeyExpired -> node key must be replaced
+     *   resp.AuthURL        -> authorization pending, not yet usable
+     *   resp.User.ID        -> DISPLAY ONLY, copied into persist.UserProfile
+     *
+     * (It also handles resp.NodeKeySignature for tailnet lock, which microlink
+     * does not implement, and logs resp.MachineAuthorized.)
+     *
+     * This previously errored on `User.ID == 0 && User.DisplayName == ""`,
+     * which is not a health signal in either half:
+     *
+     *   - User.DisplayName is documented as an OVERRIDE - "if non-empty
+     *     overrides Login field" (tailcfg.go:271). Empty is the normal case;
+     *     the reference reads the real name from resp.Login.DisplayName.
+     *   - A node with no bound user is legitimate. Auth-key registrations,
+     *     and tag-owned nodes in particular, are owned by a tag rather than
+     *     a user, so User.ID == 0 is expected rather than exceptional.
+     *
+     * Observed on a healthy ESP32-S3: a tag-owned node registered by auth key
+     * logged this as ESP_LOGE on every boot while holding a valid address,
+     * exchanging map updates and passing traffic. */
     {
-        cJSON *user = cJSON_GetObjectItem(resp_json, "User");
-        int   id_val   = -1;
+        cJSON *err_j = cJSON_GetObjectItem(resp_json, "Error");
+        if (err_j && cJSON_IsString(err_j) && err_j->valuestring && *err_j->valuestring) {
+            ESP_LOGE(TAG, "RegisterResponse.Error: %s", err_j->valuestring);
+            ESP_LOGE(TAG, "  Registration was refused by the control plane. "
+                          "Check the auth_key is valid and not expired.");
+            cJSON_Delete(resp_json);
+            return -1;
+        }
+
+        cJSON *exp_j = cJSON_GetObjectItem(resp_json, "NodeKeyExpired");
+        if (exp_j && cJSON_IsTrue(exp_j)) {
+            /* The reference regenerates the node key and re-registers
+             * automatically here (direct.go:890-897 returns regen=true). We do
+             * not implement automatic regeneration, so this is fatal and needs
+             * operator action - a microlink divergence, not reference behaviour. */
+            ESP_LOGE(TAG, "RegisterResponse.NodeKeyExpired - this node key is no "
+                          "longer accepted. microlink does not regenerate keys "
+                          "automatically: run microlink_factory_reset + reboot.");
+            cJSON_Delete(resp_json);
+            return -1;
+        }
+
+        cJSON *url_j = cJSON_GetObjectItem(resp_json, "AuthURL");
+        if (url_j && cJSON_IsString(url_j) && url_j->valuestring && *url_j->valuestring) {
+            ESP_LOGW(TAG, "RegisterResponse.AuthURL set - authorization is pending. "
+                          "Approve this node at: %s", url_j->valuestring);
+        }
+
+        /* Identity, for logging only. ID from User, name from Login (with the
+         * User.DisplayName override applied if present) - as the reference does. */
+        cJSON *user  = cJSON_GetObjectItem(resp_json, "User");
+        cJSON *login = cJSON_GetObjectItem(resp_json, "Login");
+        int id_val = 0;
         const char *name_val = "";
         if (user) {
-            cJSON *id_j   = cJSON_GetObjectItem(user, "ID");
-            cJSON *name_j = cJSON_GetObjectItem(user, "DisplayName");
-            if (id_j   && cJSON_IsNumber(id_j))   id_val   = id_j->valueint;
-            if (name_j && cJSON_IsString(name_j)) name_val = name_j->valuestring;
+            cJSON *id_j = cJSON_GetObjectItem(user, "ID");
+            if (id_j && cJSON_IsNumber(id_j)) id_val = id_j->valueint;
+        }
+        if (login) {
+            cJSON *n = cJSON_GetObjectItem(login, "DisplayName");
+            if (!n || !cJSON_IsString(n) || !n->valuestring || !*n->valuestring)
+                n = cJSON_GetObjectItem(login, "LoginName");
+            if (n && cJSON_IsString(n) && n->valuestring) name_val = n->valuestring;
+        }
+        if (user) {   /* User.DisplayName overrides Login when non-empty */
+            cJSON *dn = cJSON_GetObjectItem(user, "DisplayName");
+            if (dn && cJSON_IsString(dn) && dn->valuestring && *dn->valuestring)
+                name_val = dn->valuestring;
         }
         ml->register_user_id = id_val;
-        strlcpy(ml->register_user_name, name_val ? name_val : "",
-                sizeof ml->register_user_name);
-        if (id_val == 0 && (!name_val || !*name_val)) {
-            ESP_LOGE(TAG,
-                "RegisterResponse User.ID=0 + DisplayName=\"\" — the "
-                "control plane accepted the connect but didn't bind us "
-                "to a real user.");
-            ESP_LOGE(TAG,
-                "  Most likely: the auth_key is invalid/expired, or the "
-                "node-key was previously registered and then deleted on "
-                "the server. Fix: regenerate the device identity "
-                "(microlink_factory_reset + reboot) or supply a fresh "
-                "auth_key + reauthorize the node on the control plane.");
-        } else if (id_val > 0) {
-            ESP_LOGI(TAG, "Registered as User.ID=%d \"%s\"",
-                     id_val, name_val ? name_val : "");
+        strlcpy(ml->register_user_name, name_val, sizeof ml->register_user_name);
+
+        if (id_val > 0 || *name_val) {
+            ESP_LOGI(TAG, "Registered as User.ID=%d \"%s\"", id_val, name_val);
+        } else {
+            /* Normal for auth-key and tag-owned registrations. */
+            ESP_LOGI(TAG, "Registered (no bound user - auth-key or tag-owned node)");
         }
     }
 
@@ -1866,7 +1919,11 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
     }
 
 check_removed:
-    /* Handle PeersRemoved — array of nodekey strings (long-poll delta updates) */
+    /* Handle PeersRemoved (long-poll delta updates). Per tailcfg this is
+     * []NodeID — integers — and that is what both Tailscale and Headscale
+     * send ("PeersRemoved":[59]); the peer slot is resolved by node_id in
+     * wg_mgr (#42). A nodekey-string element is still accepted as a
+     * fallback, but no control plane is known to send that form. */
     cJSON *removed = cJSON_GetObjectItem(root, "PeersRemoved");
     if (removed && cJSON_IsArray(removed)) {
         int rm_count = cJSON_GetArraySize(removed);
@@ -1874,20 +1931,26 @@ check_removed:
 
         cJSON *key_item;
         cJSON_ArrayForEach(key_item, removed) {
-            if (!key_item->valuestring) continue;
+            if (!cJSON_IsNumber(key_item) && !key_item->valuestring) continue;
 
             ml_peer_update_t *update = ml_psram_calloc(1, sizeof(ml_peer_update_t));
             if (!update) continue;
 
             update->action = ML_PEER_REMOVE;
 
-            const char *hex = key_item->valuestring;
-            if (strncmp(hex, "nodekey:", 8) == 0) hex += 8;
-            hex_to_bytes(hex, update->public_key, 32);
-
-            ESP_LOGI(TAG, "  Remove peer: %02x%02x%02x%02x...",
-                     update->public_key[0], update->public_key[1],
-                     update->public_key[2], update->public_key[3]);
+            if (cJSON_IsNumber(key_item)) {
+                update->has_node_id = true;
+                update->node_id = (uint64_t)(int64_t)key_item->valuedouble;
+                ESP_LOGI(TAG, "  Remove peer: NodeID=%llu",
+                         (unsigned long long)update->node_id);
+            } else {
+                const char *hex = key_item->valuestring;
+                if (strncmp(hex, "nodekey:", 8) == 0) hex += 8;
+                hex_to_bytes(hex, update->public_key, 32);
+                ESP_LOGI(TAG, "  Remove peer: %02x%02x%02x%02x...",
+                         update->public_key[0], update->public_key[1],
+                         update->public_key[2], update->public_key[3]);
+            }
 
             if (xQueueSend(ml->peer_update_queue, &update, pdMS_TO_TICKS(100)) != pdTRUE) {
                 free(update);
@@ -2235,6 +2298,9 @@ static int do_map_exchange(microlink_t *ml, ml_noise_state_t *noise, bool send_r
     cJSON *hostinfo = cJSON_CreateObject();
     const char *dev_name = (ml->config.device_name && ml->config.device_name[0]) ? ml->config.device_name : microlink_default_device_name();
     cJSON_AddStringToObject(hostinfo, "Hostname", dev_name);
+    if (ml->config.ipn_version && ml->config.ipn_version[0]) {
+        cJSON_AddStringToObject(hostinfo, "IPNVersion", ml->config.ipn_version);
+    }
     cJSON_AddStringToObject(hostinfo, "OS", "linux");
     cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
     cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
