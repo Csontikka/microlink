@@ -2018,22 +2018,25 @@ void ml_wg_mgr_task(void *arg) {
      * exchange (a peer that keeps probing because its WireGuard session never
      * completes) packets arrived faster than one X25519 decrypt + reply, the
      * drains never ended, and the priority-1 loop got no CPU for >5 s --
-     * the task watchdog then aborted the whole device. Now each iteration
-     * processes at most a burst of packets within a time budget and ALWAYS
+     * the task watchdog then aborted the whole device. Now each drain is
+     * bounded by a burst count and a time window and the iteration ALWAYS
      * reaches the 10 ms sleep, so lower-priority tasks are guaranteed a
-     * share of the core no matter how hard a peer pushes. Excess packets
-     * simply wait in the queue for the next iteration (DISCO is lossy by
+     * share of the core no matter how hard a peer pushes. The WireGuard
+     * drains get their OWN windows, never charged for the DISCO work: the
+     * data plane must not lose frames because discovery was busy. Excess
+     * packets wait in the queue for the next iteration (DISCO is lossy by
      * design; the queues are bounded and net_io drops on overflow). */
-    #define WG_MGR_ITER_BUDGET_MS   40
+    #define WG_MGR_DISCO_BUDGET_MS  40   /* DISCO drain: burst + time, whichever first */
     #define WG_MGR_DISCO_BURST      8
-    #define WG_MGR_WG_BURST         32
+    #define WG_MGR_WG_BUDGET_MS     30   /* each WG drain: its OWN budget, never charged for DISCO */
+    #define WG_MGR_WG_BURST         64
     uint32_t disco_rx_10s = 0;          /* DISCO packets processed, per 10 s summary */
-    uint32_t budget_hits_10s = 0;       /* iterations that hit the burst/time budget with work left */
-    uint64_t iter_start_ms = 0;
-    #define WG_MGR_BUDGET_LEFT() ((ml_get_time_ms() - iter_start_ms) < WG_MGR_ITER_BUDGET_MS)
+    uint32_t budget_hits_10s = 0;       /* iterations that hit the DISCO burst/time budget with work left */
+    uint64_t budget_start_ms = 0;
+    #define WG_MGR_BUDGET_LEFT(ms) ((ml_get_time_ms() - budget_start_ms) < (ms))
 
     while (!(xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST)) {
-        iter_start_ms = ml_get_time_ms();
+        budget_start_ms = ml_get_time_ms();   /* DISCO budget window */
 
         /* Process peer updates from coord task */
         process_peer_updates(ml);
@@ -2076,7 +2079,7 @@ void ml_wg_mgr_task(void *arg) {
             uint8_t tail = __atomic_load_n(&ml->zc.rx_tail, __ATOMIC_RELAXED);
             uint8_t head = __atomic_load_n(&ml->zc.rx_head, __ATOMIC_ACQUIRE);
             int zc_n = 0;
-            while (tail != head && zc_n++ < WG_MGR_DISCO_BURST && WG_MGR_BUDGET_LEFT()) {
+            while (tail != head && zc_n++ < WG_MGR_DISCO_BURST && WG_MGR_BUDGET_LEFT(WG_MGR_DISCO_BUDGET_MS)) {
                 ml_zc_disco_entry_t *entry = &ml->zc.rx_ring[tail];
                 ml_rx_packet_t disco_pkt = {
                     .data = entry->data,
@@ -2096,7 +2099,7 @@ void ml_wg_mgr_task(void *arg) {
 #endif
         /* Queue-based path: DISCO from DERP relay + fallback when zero-copy disabled */
         ml_rx_packet_t disco_pkt;
-        for (int n = 0; n < WG_MGR_DISCO_BURST && WG_MGR_BUDGET_LEFT() &&
+        for (int n = 0; n < WG_MGR_DISCO_BURST && WG_MGR_BUDGET_LEFT(WG_MGR_DISCO_BUDGET_MS) &&
                         xQueueReceive(ml->disco_rx_queue, &disco_pkt, 0) == pdTRUE; n++) {
             process_disco_packet(ml, &disco_pkt);
             free(disco_pkt.data);
@@ -2106,7 +2109,8 @@ void ml_wg_mgr_task(void *arg) {
 
         /* Process WireGuard packets */
         ml_rx_packet_t wg_pkt;
-        for (int n = 0; n < WG_MGR_WG_BURST && WG_MGR_BUDGET_LEFT() &&
+        budget_start_ms = ml_get_time_ms();   /* WG data plane: fresh window, not charged for DISCO */
+        for (int n = 0; n < WG_MGR_WG_BURST && WG_MGR_BUDGET_LEFT(WG_MGR_WG_BUDGET_MS) &&
                         xQueueReceive(ml->wg_rx_queue, &wg_pkt, 0) == pdTRUE; n++) {
             process_wg_packet(ml, &wg_pkt);
         }
@@ -2147,8 +2151,10 @@ void ml_wg_mgr_task(void *arg) {
          * slow crypto/probe paths; without this second drain, download frames
          * pile up in wg_rx_queue and overflow (→ DERP-RX drops → TCP backoff →
          * the sustained rate falls well below the burst peak) while the task
-         * was busy. 2026-05-27. Bounded like the first drain (#46). */
-        for (int n = 0; n < WG_MGR_WG_BURST && WG_MGR_BUDGET_LEFT() &&
+         * was busy. 2026-05-27. Bounded like the first drain, with its own
+         * window so the slow periodic work above cannot starve it (#46). */
+        budget_start_ms = ml_get_time_ms();
+        for (int n = 0; n < WG_MGR_WG_BURST && WG_MGR_BUDGET_LEFT(WG_MGR_WG_BUDGET_MS) &&
                         xQueueReceive(ml->wg_rx_queue, &wg_pkt, 0) == pdTRUE; n++) {
             process_wg_packet(ml, &wg_pkt);
         }
