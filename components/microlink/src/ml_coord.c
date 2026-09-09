@@ -260,7 +260,7 @@ static int hex_to_bytes32(const char *hex, uint8_t out[32]) {
     return 0;
 }
 
-/* Parse the /key?v=88 HTTP response (already NUL-terminated).
+/* Parse the /key?v=<ML_CTRL_PROTOCOL_VER> HTTP response (already NUL-terminated).
  * Skips HTTP headers, handles chunked transfer encoding, decodes the JSON
  * "publicKey":"mkey:<64 hex>" field, and hex-decodes the 32-byte Noise pubkey
  * into pubkey_out.  Returns 0 on success, -1 on parse/decode error. */
@@ -315,7 +315,7 @@ static int parse_pubkey_response(const char *resp, uint8_t pubkey_out[32]) {
 }
 
 /* Open a short-lived connection to host:port (plain TCP or TLS per
- * ml->use_tls), GET /key?v=88, parse the JSON body, extract publicKey,
+ * ml->use_tls), GET /key?v=<ML_CTRL_PROTOCOL_VER>, parse the JSON body, extract publicKey,
  * hex-decode into ml->ctrl_noise_pubkey.  Returns 0 on success, -1 on any
  * failure.  Closes its own socket / destroys its own transient TLS handle. */
 static int fetch_server_pubkey(microlink_t *ml, const char *host, const char *port) {
@@ -324,7 +324,8 @@ static int fetch_server_pubkey(microlink_t *ml, const char *host, const char *po
     /* The handle is local — never stored in ml.                           */
     /* ------------------------------------------------------------------ */
     if (ml->use_tls) {
-        ESP_LOGI(TAG, "Fetching Noise server pubkey from https://%s:%s/key?v=88", host, port);
+        ESP_LOGI(TAG, "Fetching Noise server pubkey from https://%s:%s/key?v=%d", host, port,
+                 ML_CTRL_PROTOCOL_VER);
 
         const esp_tls_cfg_t cfg = {
             .crt_bundle_attach = esp_crt_bundle_attach,
@@ -348,13 +349,20 @@ static int fetch_server_pubkey(microlink_t *ml, const char *host, const char *po
          * (matches what the coord connection uses), falling back to host. */
         const char *host_hdr = (ml->ctrl_host_hdr[0]) ? ml->ctrl_host_hdr : host;
         char req[256];
+        /* The capability version on /key must be the same one every other
+         * request carries (ML_CTRL_PROTOCOL_VER) -- tailscaled sends its
+         * CurrentCapabilityVersion here too. It was a hardcoded 88 (Tailscale
+         * 1.62) while the MapRequest already said 131; Headscale >= 0.29
+         * drops the minimum supported version above 88 and answers
+         * "unsupported client version" (HTTP 400), so registration died at
+         * the very first step. SaaS accepted both. */
         int req_len = snprintf(req, sizeof(req),
-            "GET /key?v=88 HTTP/1.1\r\n"
+            "GET /key?v=%d HTTP/1.1\r\n"
             "Host: %s\r\n"
             "User-Agent: microlink\r\n"
             "Connection: close\r\n"
             "\r\n",
-            host_hdr);
+            ML_CTRL_PROTOCOL_VER, host_hdr);
         if (req_len <= 0 || req_len >= (int)sizeof(req)) {
             ESP_LOGE(TAG, "fetch_server_pubkey: request snprintf overflow");
             esp_tls_conn_destroy(tls);
@@ -403,7 +411,8 @@ static int fetch_server_pubkey(microlink_t *ml, const char *host, const char *po
     struct addrinfo *res = NULL;
     int rc = -1;
 
-    ESP_LOGI(TAG, "Fetching Noise server pubkey from http://%s:%s/key?v=88", host, port);
+    ESP_LOGI(TAG, "Fetching Noise server pubkey from http://%s:%s/key?v=%d", host, port,
+             ML_CTRL_PROTOCOL_VER);
 
     if (ml_getaddrinfo(host, port, &hints, &res) != 0 || !res) {
         ESP_LOGE(TAG, "fetch_server_pubkey: DNS resolve failed for %s", host);
@@ -430,12 +439,12 @@ static int fetch_server_pubkey(microlink_t *ml, const char *host, const char *po
 
     char req[256];
     int req_len = snprintf(req, sizeof(req),
-        "GET /key?v=88 HTTP/1.1\r\n"
+        "GET /key?v=%d HTTP/1.1\r\n"
         "Host: %s\r\n"
         "User-Agent: microlink\r\n"
         "Connection: close\r\n"
         "\r\n",
-        (ml->ctrl_host_hdr[0]) ? ml->ctrl_host_hdr : host);
+        ML_CTRL_PROTOCOL_VER, (ml->ctrl_host_hdr[0]) ? ml->ctrl_host_hdr : host);
     if (req_len <= 0 || req_len >= (int)sizeof(req)) goto out;
 
     if (ml_send(sock, (uint8_t *)req, req_len, 0) != req_len) {
@@ -847,7 +856,7 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
      * each instance generates its own Noise keypair, so the hardcoded
      * Tailscale SaaS server pubkey in ml_noise_init would always fail the
      * ChaCha20-Poly1305 machine-key decrypt.  Fetch the real server pubkey
-     * from /key?v=88 here, once, and cache it on ml.  (ctrl_host_parsed /
+     * from /key?v=<ML_CTRL_PROTOCOL_VER> here, once, and cache it on ml.  (ctrl_host_parsed /
      * ctrl_port_str were filled by do_tcp_connect just before this state.) */
     const uint8_t *server_pubkey = NULL;
     if (ml->ctrl_host[0]) {

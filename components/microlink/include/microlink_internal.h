@@ -646,7 +646,7 @@ struct microlink_s {
     char ctrl_host_hdr[72];
 
     /* Noise server static public key fetched from the custom control plane
-     * via GET /key?v=88. Valid only when ctrl_noise_pubkey_valid is true;
+     * via GET /key?v=<ML_CTRL_PROTOCOL_VER>. Valid only when ctrl_noise_pubkey_valid is true;
      * otherwise ml_noise_init falls back to the hardcoded Tailscale SaaS
      * server key. */
     uint8_t ctrl_noise_pubkey[32];
