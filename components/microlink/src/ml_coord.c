@@ -40,6 +40,26 @@
 
 static const char *TAG = "ml_coord";
 
+/* A failed control-plane buffer allocation used to be silent: ml_psram_malloc()
+ * returns NULL, the caller returns -1 and the state machine only logs
+ * "MapRequest failed, will retry" - indistinguishable from a network failure,
+ * except that it fires within a millisecond of the send. Real case
+ * (esphome-tailscale#45): a 2 MB-PSRAM board sharing PSRAM with an audio
+ * pipeline could never fit the two 512 KB MapResponse buffers and looped on
+ * that message forever. Say what was asked for and what is actually free, and
+ * name the knob. */
+static void log_alloc_failure(const char *what, size_t size)
+{
+    ESP_LOGE(TAG, "%s: cannot allocate %u KB - PSRAM free %u KB (largest block %u KB), "
+                  "internal free %u KB (largest %u KB). Lower CONFIG_ML_H2_BUFFER_SIZE_KB / "
+                  "CONFIG_ML_JSON_BUFFER_SIZE_KB or free the PSRAM held by other components",
+             what, (unsigned)((size + 1023) / 1024),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+             (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+             (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
+}
+
 /* Pin a freshly-created BSD socket to the upstream (STA) netif via
  * SO_BINDTODEVICE (lwIP -> tcp_bind_netif), so the ESP's OWN control-plane /
  * DERP TCP always egresses the physical uplink and is immune to the
@@ -2277,12 +2297,19 @@ static int do_map_exchange(microlink_t *ml, ml_noise_state_t *noise, bool send_r
      * This is critical because a single H2 frame can span multiple Noise frames
      * (v1 does the same with h2_buffer).
      * Smart timeout: extend to 60s for large tailnets (300+ peers = 240KB+). */
-    uint8_t *h2_recv = ml_psram_malloc(ML_H2_BUFFER_SIZE);  /* 512KB for 300+ peer tailnets */
-    if (!h2_recv) return -1;
+    uint8_t *h2_recv = ml_psram_malloc(ML_H2_BUFFER_SIZE);  /* Kconfig-sized, default 512KB for 300+ peer tailnets */
+    if (!h2_recv) {
+        log_alloc_failure("MapResponse HTTP/2 receive buffer", ML_H2_BUFFER_SIZE);
+        return -1;
+    }
     size_t h2_total = 0;
 
     uint8_t *resp_buf = ml_psram_malloc(ML_JSON_BUFFER_SIZE);
-    if (!resp_buf) { free(h2_recv); return -1; }
+    if (!resp_buf) {
+        log_alloc_failure("MapResponse JSON buffer", ML_JSON_BUFFER_SIZE);
+        free(h2_recv);
+        return -1;
+    }
     size_t json_total = 0;
 
     /* Set extended recv timeout for large MapResponse (60 seconds) */
@@ -2300,7 +2327,10 @@ static int do_map_exchange(microlink_t *ml, ml_noise_state_t *noise, bool send_r
     bool got_end_stream = false;
     for (int read_count = 0; read_count < 200; read_count++) {
         uint8_t *frame_buf = ml_psram_malloc(65536);
-        if (!frame_buf) break;
+        if (!frame_buf) {
+            log_alloc_failure("MapResponse Noise frame buffer", 65536);
+            break;
+        }
 
         int frame_len = noise_recv(ml, noise, frame_buf, 65536);
         if (frame_len <= 0) {
@@ -2946,7 +2976,10 @@ static void lp_acc_append(microlink_t *ml, const uint8_t *data, size_t len) {
          * comes off the wire. */
         ml->lp_acc = ml_psram_malloc(ML_JSON_BUFFER_SIZE + 1);
         ml->lp_acc_len = 0;
-        if (!ml->lp_acc) return;
+        if (!ml->lp_acc) {
+            log_alloc_failure("long-poll accumulator", ML_JSON_BUFFER_SIZE + 1);
+            return;
+        }
     }
     if (ml->lp_acc_len + len > ML_JSON_BUFFER_SIZE) {
         ESP_LOGW(TAG, "long-poll accumulator would overflow (%u + %u) - resetting",
