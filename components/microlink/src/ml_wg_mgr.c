@@ -507,6 +507,20 @@ static int find_peer_by_disco_key(microlink_t *ml, const uint8_t *disco_key) {
     return -1;
 }
 
+/* Shared DISCO secret with peer p, derived on first use and again after the
+ * peer's disco key changed (see ml_peer_t.disco_shared). NULL on failure. */
+static const uint8_t *disco_shared_key(microlink_t *ml, ml_peer_t *p) {
+    if (!p->disco_shared_valid || memcmp(p->disco_shared_for, p->disco_key, 32) != 0) {
+        if (nacl_box_beforenm(p->disco_shared, p->disco_key, ml->disco_private_key) != 0) {
+            p->disco_shared_valid = false;
+            return NULL;
+        }
+        memcpy(p->disco_shared_for, p->disco_key, 32);
+        p->disco_shared_valid = true;
+    }
+    return p->disco_shared;
+}
+
 static int find_peer_by_node_id(microlink_t *ml, uint64_t node_id) {
     if (node_id == 0) return -1;
     for (int i = 0; i < ml->peer_count; i++) {
@@ -601,6 +615,7 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     p->trust_until_ms = 0;
     p->last_send_ms = 0;
     p->last_cmm_rx_ms = 0;
+    p->disco_shared_valid = false;
     p->last_upgrade_ms = 0;
     p->has_direct_path = false;
     p->best_ip = 0;
@@ -924,8 +939,9 @@ static void disco_build_ping(microlink_t *ml, int peer_idx,
 
     /* Encrypt with NaCl box: our disco private key -> peer's disco public key */
     uint8_t ciphertext[46 + NACL_BOX_MACBYTES];
-    nacl_box(ciphertext, plaintext, sizeof(plaintext), nonce,
-             p->disco_key, ml->disco_private_key);
+    const uint8_t *shared = disco_shared_key(ml, p);
+    if (!shared) { *out_len = 0; return; }
+    nacl_box_afternm(ciphertext, plaintext, sizeof(plaintext), nonce, shared);
 
     /* Build packet: magic(6) + our_disco_pubkey(32) + nonce(24) + ciphertext(62) = 124 bytes */
     size_t pos = 0;
@@ -1000,8 +1016,9 @@ static void disco_build_pong(microlink_t *ml, int peer_idx,
 
     /* Encrypt */
     uint8_t ciphertext[32 + NACL_BOX_MACBYTES];
-    nacl_box(ciphertext, plaintext, sizeof(plaintext), nonce,
-             p->disco_key, ml->disco_private_key);
+    const uint8_t *shared = disco_shared_key(ml, p);
+    if (!shared) { *out_len = 0; return; }
+    nacl_box_afternm(ciphertext, plaintext, sizeof(plaintext), nonce, shared);
 
     /* Build packet */
     size_t pos = 0;
@@ -1374,19 +1391,41 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
 
     if (ciphertext_len < NACL_BOX_MACBYTES) return;
 
+    /* Identify the sender by its disco key BEFORE touching the crypto
+     * (reference client: discoInfoForKnownPeerLocked only for keys that
+     * belong to a peer). A key that matches no peer -- a rotation the netmap
+     * has not delivered yet, or a stranger -- is dropped without an X25519;
+     * the handlers below could do nothing with it anyway. */
+    int sender_idx = find_peer_by_disco_key(ml, sender_disco_key);
+    if (sender_idx < 0) {
+        static uint64_t last_unknown_log_ms = 0;
+        static uint32_t unknown_suppressed = 0;
+        uint64_t now_ms = ml_get_time_ms();
+        if (now_ms - last_unknown_log_ms > 10000) {
+            ESP_LOGD(TAG, "DISCO from unknown disco key %02x%02x%02x%02x... via %s dropped"
+                          " (%lu more in the last 10 s)",
+                     sender_disco_key[0], sender_disco_key[1],
+                     sender_disco_key[2], sender_disco_key[3],
+                     pkt->via_derp ? "DERP" : "direct", (unsigned long)unknown_suppressed);
+            last_unknown_log_ms = now_ms;
+            unknown_suppressed = 0;
+        } else {
+            unknown_suppressed++;
+        }
+        return;
+    }
+    const uint8_t *shared = disco_shared_key(ml, &ml->peers[sender_idx]);
+    if (!shared) return;
+
     size_t plaintext_len = ciphertext_len - NACL_BOX_MACBYTES;
     uint8_t *plaintext = malloc(plaintext_len);
     if (!plaintext) return;
 
-    if (nacl_box_open(plaintext, ciphertext, ciphertext_len, nonce,
-                      sender_disco_key, ml->disco_private_key) != 0) {
-        /* Name the claimed sender (#31): the packet carries the sender's
-         * current disco pubkey — if it matches a known peer the failure is
-         * OUR stale key material; if unknown, the sender rotated or is
-         * foreign, and the prefix lets it be correlated externally. */
-        int sender_idx = find_peer_by_disco_key(ml, sender_disco_key);
+    if (nacl_box_open_afternm(plaintext, ciphertext, ciphertext_len, nonce, shared) != 0) {
+        /* The sender is a known peer, so a MAC failure means OUR key material
+         * for it is stale (#31); the prefix lets it be correlated externally. */
         ESP_LOGW(TAG, "DISCO decrypt failed (from %s via %s, disco_key=%02x%02x%02x%02x...)",
-                 sender_idx >= 0 ? ml->peers[sender_idx].hostname : "unknown peer",
+                 ml->peers[sender_idx].hostname,
                  pkt->via_derp ? "DERP" : "direct",
                  sender_disco_key[0], sender_disco_key[1],
                  sender_disco_key[2], sender_disco_key[3]);
@@ -1645,8 +1684,9 @@ static void disco_send_call_me_maybe(microlink_t *ml, int peer_idx) {
     esp_fill_random(nonce, DISCO_NONCE_LEN);
 
     uint8_t ciphertext[sizeof(plaintext) + NACL_BOX_MACBYTES];
-    nacl_box(ciphertext, plaintext, pt_len, nonce,
-             p->disco_key, ml->disco_private_key);
+    const uint8_t *shared = disco_shared_key(ml, p);
+    if (!shared) return;
+    nacl_box_afternm(ciphertext, plaintext, pt_len, nonce, shared);
 
     /* Build packet: magic(6) + disco_pubkey(32) + nonce(24) + ciphertext */
     uint8_t pkt[256];

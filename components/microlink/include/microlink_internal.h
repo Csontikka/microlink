@@ -334,6 +334,18 @@ typedef struct {
     uint64_t last_upgrade_ms;       /* Last path upgrade attempt */
     uint64_t last_cmm_rx_ms;        /* Last CallMeMaybe-triggered ping burst (floor) */
 
+    /* DISCO shared secret with this peer (NaCl box beforenm of our disco
+     * private key and the peer's disco key), derived once and reused for
+     * every DISCO packet in both directions -- reference client:
+     * discoInfo.sharedKey. It used to be recomputed per packet: one X25519,
+     * ~16 ms on an ESP32-S3, which is what made every DISCO packet and every
+     * manager tick with two heartbeats in it expensive. disco_shared_for[]
+     * remembers the disco key it was derived from, so a rotation arriving by
+     * any netmap path re-derives it on next use. */
+    uint8_t disco_shared[32];
+    uint8_t disco_shared_for[32];
+    bool disco_shared_valid;
+
     /* Best direct path */
     uint32_t best_ip;
     uint16_t best_port;
