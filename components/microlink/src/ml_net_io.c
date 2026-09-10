@@ -213,5 +213,6 @@ void ml_net_io_task(void *arg) {
     }
 
     ESP_LOGI(TAG, "Net I/O task exiting");
+    ml_task_exiting(ml);
     vTaskDelete(NULL);
 }

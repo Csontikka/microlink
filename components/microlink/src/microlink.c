@@ -441,6 +441,7 @@ skip_bsd_socket:
         ESP_LOGE(TAG, "Failed to create net_io task");
         return ESP_FAIL;
     }
+    __atomic_add_fetch(&ml->tasks_alive, 1, __ATOMIC_SEQ_CST);
 
     ret = xTaskCreatePinnedToCore(ml_derp_tx_task, "ml_derp_tx", ML_TASK_DERP_TX_STACK,
                                    ml, ML_TASK_DERP_TX_PRIO, &ml->derp_tx_task, ML_TASK_DERP_TX_CORE);
@@ -448,6 +449,7 @@ skip_bsd_socket:
         ESP_LOGE(TAG, "Failed to create derp_tx task");
         return ESP_FAIL;
     }
+    __atomic_add_fetch(&ml->tasks_alive, 1, __ATOMIC_SEQ_CST);
 
     /* DERP reader: split out from the unified I/O task so RX (mbedtls_ssl_read)
      * and TX (mbedtls_ssl_write) run concurrently on the same ssl context (one
@@ -459,6 +461,7 @@ skip_bsd_socket:
         ESP_LOGE(TAG, "Failed to create derp_rx task");
         return ESP_FAIL;
     }
+    __atomic_add_fetch(&ml->tasks_alive, 1, __ATOMIC_SEQ_CST);
 
     ret = xTaskCreatePinnedToCore(ml_coord_task, "ml_coord", ML_TASK_COORD_STACK,
                                    ml, ML_TASK_COORD_PRIO, &ml->coord_task, ML_TASK_COORD_CORE);
@@ -466,6 +469,7 @@ skip_bsd_socket:
         ESP_LOGE(TAG, "Failed to create coord task");
         return ESP_FAIL;
     }
+    __atomic_add_fetch(&ml->tasks_alive, 1, __ATOMIC_SEQ_CST);
 
     ret = xTaskCreatePinnedToCore(ml_wg_mgr_task, "ml_wg_mgr", ML_TASK_WG_MGR_STACK,
                                    ml, ML_TASK_WG_MGR_PRIO, &ml->wg_mgr_task, ML_TASK_WG_MGR_CORE);
@@ -473,6 +477,7 @@ skip_bsd_socket:
         ESP_LOGE(TAG, "Failed to create wg_mgr task");
         return ESP_FAIL;
     }
+    __atomic_add_fetch(&ml->tasks_alive, 1, __ATOMIC_SEQ_CST);
 
     /* WiFi is expected to be connected before microlink_start() is called.
      * Signal the event so coord/wg_mgr tasks proceed immediately. */
@@ -530,9 +535,29 @@ esp_err_t microlink_stop(microlink_t *ml) {
     /* Wait for tasks to exit (they check ML_EVT_SHUTDOWN_REQUEST).
      * Tasks call vTaskDelete(NULL) to self-delete, so we must NOT call
      * vTaskDelete() on them again — that causes a crash in uxListRemove
-     * because the task's list node is already invalid. Just wait and
-     * NULL the handles. */
-    vTaskDelay(pdMS_TO_TICKS(3000));
+     * because the task's list node is already invalid. Wait for them to
+     * sign off (ml_task_exiting) -- bounded, but NOT a fixed delay: a
+     * coord task still inside poll_map_update() after the old 3 s sleep
+     * met microlink_destroy()'s free() and died in the freed instance
+     * (PANIC, reference router, three connect requests in a row). The
+     * longest legitimate holdout is a blocking DNS lookup or a TLS
+     * handshake that shutdown() cannot interrupt, well inside 15 s. */
+    {
+        const int max_wait_ms = 15000;
+        int waited = 0;
+        while (__atomic_load_n(&ml->tasks_alive, __ATOMIC_SEQ_CST) > 0 && waited < max_wait_ms) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            waited += 50;
+        }
+        int left = __atomic_load_n(&ml->tasks_alive, __ATOMIC_SEQ_CST);
+        if (left > 0) {
+            ESP_LOGE(TAG, "%d task(s) still running %d ms after the stop request -- "
+                          "the instance will be leaked rather than freed under them", left, waited);
+            ml->stop_incomplete = true;
+        } else {
+            ESP_LOGI(TAG, "All tasks exited (%d ms)", waited);
+        }
+    }
 
     ml->net_io_task = NULL;
     ml->derp_tx_task = NULL;
@@ -564,6 +589,20 @@ void microlink_destroy(microlink_t *ml) {
     if (!ml) return;
 
     microlink_stop(ml);
+    if (ml->stop_incomplete) {
+        /* A task is still executing on this instance. Freeing it now is the
+         * use-after-free we are here to avoid; a leaked instance is the
+         * lesser evil and is loud in the log. */
+        ESP_LOGE(TAG, "Destroy skipped: a task still runs on this instance (leaked on purpose)");
+        return;
+    }
+    /* Only now is everything the tasks owned quiescent. The DERP TLS state
+     * and the long-poll accumulators (two PSRAM buffers of
+     * ML_JSON_BUFFER_SIZE) were never released here before: every
+     * stop/start cycle lost ~650 KB on the reference router. */
+    ml_derp_disconnect(ml);
+    if (ml->h2_acc) { free(ml->h2_acc); ml->h2_acc = NULL; ml->h2_acc_len = 0; }
+    if (ml->lp_acc) { free(ml->lp_acc); ml->lp_acc = NULL; ml->lp_acc_len = 0; }
 
     /* Deinitialize peer NVS */
     ml_peer_nvs_deinit();
@@ -597,6 +636,10 @@ void microlink_destroy(microlink_t *ml) {
 /* ============================================================================
  * State Queries
  * ========================================================================== */
+
+void ml_task_exiting(microlink_t *ml) {
+    if (ml) __atomic_sub_fetch(&ml->tasks_alive, 1, __ATOMIC_SEQ_CST);
+}
 
 microlink_state_t microlink_get_state(const microlink_t *ml) {
     return ml ? ml->state : ML_STATE_IDLE;

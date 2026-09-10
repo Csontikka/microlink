@@ -505,6 +505,13 @@ struct microlink_s {
     TaskHandle_t derp_rx_task;
     TaskHandle_t coord_task;
     TaskHandle_t wg_mgr_task;
+    /* Tasks started by microlink_start() that have not signed off yet
+     * (ml_task_exiting). microlink_stop() waits for this to reach zero
+     * instead of sleeping a fixed 3 s and hoping: a coord task still inside
+     * poll_map_update() when microlink_destroy() freed the instance was a
+     * use-after-free PANIC on the reference router (reconnect burst). */
+    volatile int tasks_alive;
+    bool stop_incomplete;           /* a task outlived the stop wait: destroy must not free */
 
     /* Queues */
     QueueHandle_t derp_tx_queue;        /* -> derp_tx task */
@@ -707,6 +714,11 @@ void ml_derp_tx_task(void *arg);
 void ml_derp_rx_task(void *arg);
 esp_err_t ml_derp_connect(microlink_t *ml);
 void ml_derp_disconnect(microlink_t *ml);
+
+/* Every microlink task calls this as its LAST statement before
+ * vTaskDelete(NULL): after it returns the task must not touch ml again,
+ * because microlink_stop() may already be tearing the instance down. */
+void ml_task_exiting(microlink_t *ml);
 esp_err_t ml_derp_queue_send(microlink_t *ml, const uint8_t *dest_key,
                               const uint8_t *data, size_t len);
 

@@ -3376,6 +3376,7 @@ void ml_coord_task(void *arg) {
                              pdFALSE, pdFALSE, portMAX_DELAY);
         if (wb & ML_EVT_SHUTDOWN_REQUEST) {
             ESP_LOGI(TAG, "Shutdown requested before WiFi, exiting");
+            ml_task_exiting(ml);
             vTaskDelete(NULL);
             return;
         }
@@ -3870,5 +3871,6 @@ void ml_coord_task(void *arg) {
     memset(&noise, 0, sizeof(noise));
 
     ESP_LOGI(TAG, "Coord task exiting");
+    ml_task_exiting(ml);
     vTaskDelete(NULL);
 }
