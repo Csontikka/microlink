@@ -2955,6 +2955,20 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
     if (!json_str) return -1;
 
     size_t json_len = strlen(json_str);
+    /* Only when something changed (reference client: magicsock setEndpoints
+     * gates the control update with endpointSetsEqual). The periodic re-STUN
+     * every 23 s used to re-send an identical update each time -- a fresh
+     * H2 stream for us and a PeersChangedPatch pushed to every peer on the
+     * tailnet -- with nothing new in it. The hash is over the whole request
+     * (endpoints, NetInfo, Hostinfo), and is reset on every (re)connect so
+     * a new map session always gets the set once. */
+    uint32_t ep_hash = 2166136261u;
+    for (size_t i = 0; i < json_len; i++) { ep_hash ^= (uint8_t)json_str[i]; ep_hash *= 16777619u; }
+    if (ep_hash == ml->last_ep_update_hash) {
+        ESP_LOGD(TAG, "Endpoint update unchanged (%d endpoints, %d bytes), not re-sent", ep_count, (int)json_len);
+        free(json_str);
+        return 0;
+    }
     ESP_LOGI(TAG, "Endpoint update: %d bytes, %d endpoints (Stream=false, OmitPeers=true)",
              (int)json_len, ep_count);
 
@@ -2992,6 +3006,7 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
     free(h2_buf);
 
     ESP_LOGI(TAG, "Endpoint update sent on H2 stream %lu", (unsigned long)sid);
+    ml->last_ep_update_hash = ep_hash;
     /* Response body is discarded — server may send empty response or
      * we'll consume it in the next poll_map_update() iteration.
      * Only the HTTP status code matters (200 = success). */
@@ -3418,6 +3433,7 @@ void ml_coord_task(void *arg) {
                 break;
             }
             ml->h2_next_stream_id = 7;  /* Reset H2 stream counter for new connection */
+            ml->last_ep_update_hash = 0;   /* new map session: send the endpoints once regardless */
             state = COORD_NOISE_HANDSHAKE;
             break;
 

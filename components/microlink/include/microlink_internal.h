@@ -557,6 +557,7 @@ struct microlink_s {
     /* STUN results (written by coord, read by coord only) */
     uint32_t stun_public_ip;
     uint16_t stun_public_port;
+    uint32_t last_ep_update_hash;   /* FNV-1a of the last endpoint update sent to control; 0 = none this session */
 
     /* STUN server cache (pre-resolved IPs, host byte order) */
     uint32_t stun_primary_ip;       /* derp9.tailscale.com resolved IPv4 */

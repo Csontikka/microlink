@@ -1139,50 +1139,25 @@ static void process_disco_ping(microlink_t *ml, const ml_rx_packet_t *pkt,
 
     if (pong_len == 0) return;
 
-    /* Send PONG via ALL paths for maximum reachability (matching v1 + tailscaled):
-     * 1. Direct reply to PING source address (opens NAT hole)
-     * 2. All known LAN endpoints (fastest path for same-network)
-     * 3. DERP relay (guaranteed delivery) */
-
-    bool direct_sent = false;
-
-    /* 1. Direct reply to PING source (if it was direct UDP) */
+    /* One PONG, back to where the PING came from (reference client
+     * handlePingLocked: a single sendDiscoMessage to the source -- the
+     * source address for a direct PING, DERP for a DERP PING). The old
+     * fan-out (source + every LAN endpoint of the peer + always a DERP copy)
+     * cost the pinger an "unmatched PONG" per extra copy and a DERP round
+     * trip per PING for nothing: a direct PING proves the direct return
+     * path already, and a peer probing our LAN address gets its PONG from
+     * that PING on its own. DERP only if the direct send itself fails. */
     if (!pkt->via_derp && pkt->src_ip != 0 && pkt->src_port != 0) {
-        disco_udp_sendto(ml, pong, pong_len, pkt->src_ip, pkt->src_port);
-        direct_sent = true;
-    }
-
-    /* 2. Send to ALL known LAN endpoints (same-network = fastest path) */
-    if (disco_has_udp_path(ml)) {
-        for (int i = 0; i < p->endpoint_count; i++) {
-            if (p->endpoints[i].is_ipv6 || p->endpoints[i].ip == 0) continue;
-            if (!is_lan_ip(p->endpoints[i].ip)) continue;
-            /* Skip if this is the same as the ping source (already sent) */
-            if (p->endpoints[i].ip == pkt->src_ip &&
-                p->endpoints[i].port == pkt->src_port) continue;
-
-            disco_udp_sendto(ml, pong, pong_len, p->endpoints[i].ip, p->endpoints[i].port);
-            direct_sent = true;
+        if (disco_udp_sendto(ml, pong, pong_len, pkt->src_ip, pkt->src_port) < 0) {
+            ml_derp_queue_send(ml, p->public_key, pong, pong_len);
+            ESP_LOGD(TAG, "PONG -> %s via DERP (direct send failed)", p->hostname);
+        } else {
+            ESP_LOGD(TAG, "PONG -> %s direct", p->hostname);
         }
-
-        /* 2b. Also try public endpoints if no LAN worked */
-        if (!direct_sent) {
-            for (int i = 0; i < p->endpoint_count; i++) {
-                if (p->endpoints[i].is_ipv6 || p->endpoints[i].ip == 0) continue;
-                if (is_lan_ip(p->endpoints[i].ip)) continue;
-
-                disco_udp_sendto(ml, pong, pong_len, p->endpoints[i].ip, p->endpoints[i].port);
-                direct_sent = true;
-                break;  /* Only try one public endpoint */
-            }
-        }
+    } else {
+        ml_derp_queue_send(ml, p->public_key, pong, pong_len);
+        ESP_LOGD(TAG, "PONG -> %s via DERP", p->hostname);
     }
-
-    /* 3. ALWAYS send via DERP (guaranteed delivery, even if direct worked) */
-    ml_derp_queue_send(ml, p->public_key, pong, pong_len);
-
-    ESP_LOGD(TAG, "PONG sent to %s (direct=%s, DERP=yes)",
-             p->hostname, direct_sent ? "yes" : "no");
 }
 
 static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
