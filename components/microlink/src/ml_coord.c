@@ -2813,6 +2813,14 @@ static int do_start_long_poll(microlink_t *ml, ml_noise_state_t *noise) {
     if (hostinfo) {
         const char *dev_name = (ml->config.device_name && ml->config.device_name[0]) ? ml->config.device_name : microlink_default_device_name();
         cJSON_AddStringToObject(hostinfo, "Hostname", dev_name);
+        /* Every Hostinfo must carry the same fields as the register/initial
+         * map ones: the control plane keeps the LAST Hostinfo it receives,
+         * so a long-poll or endpoint-update Hostinfo without IPNVersion
+         * wiped the client version from the admin console (and re-armed
+         * its "Device is too old" gate) right after every reconnect. */
+        if (ml->config.ipn_version && ml->config.ipn_version[0]) {
+            cJSON_AddStringToObject(hostinfo, "IPNVersion", ml->config.ipn_version);
+        }
         cJSON_AddStringToObject(hostinfo, "OS", "linux");
         cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
         cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
@@ -2925,6 +2933,14 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
     if (hostinfo) {
         const char *dev_name = (ml->config.device_name && ml->config.device_name[0]) ? ml->config.device_name : microlink_default_device_name();
         cJSON_AddStringToObject(hostinfo, "Hostname", dev_name);
+        /* Every Hostinfo must carry the same fields as the register/initial
+         * map ones: the control plane keeps the LAST Hostinfo it receives,
+         * so a long-poll or endpoint-update Hostinfo without IPNVersion
+         * wiped the client version from the admin console (and re-armed
+         * its "Device is too old" gate) right after every reconnect. */
+        if (ml->config.ipn_version && ml->config.ipn_version[0]) {
+            cJSON_AddStringToObject(hostinfo, "IPNVersion", ml->config.ipn_version);
+        }
         cJSON_AddStringToObject(hostinfo, "OS", "linux");
         cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
         cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
