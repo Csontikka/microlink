@@ -613,6 +613,23 @@ void microlink_destroy(microlink_t *ml) {
         ml->config_httpd = NULL;
     }
 
+    /* Whatever is still queued owns heap memory: packets the disco / wg /
+     * stun consumers never got to (data), peer updates the wg_mgr never
+     * applied (the update itself). Free them before the queues go. The DERP
+     * TX queue was drained by ml_derp_disconnect() above. */
+    {
+        ml_rx_packet_t pkt;
+        QueueHandle_t rxq[] = { ml->disco_rx_queue, ml->wg_rx_queue, ml->stun_rx_queue };
+        for (size_t i = 0; i < sizeof(rxq) / sizeof(rxq[0]); i++) {
+            if (!rxq[i]) continue;
+            while (xQueueReceive(rxq[i], &pkt, 0) == pdTRUE) free(pkt.data);
+        }
+        ml_peer_update_t *upd;
+        if (ml->peer_update_queue) {
+            while (xQueueReceive(ml->peer_update_queue, &upd, 0) == pdTRUE) free(upd);
+        }
+    }
+
     /* Delete queues */
     if (ml->derp_tx_queue) vQueueDelete(ml->derp_tx_queue);
     if (ml->disco_rx_queue) vQueueDelete(ml->disco_rx_queue);

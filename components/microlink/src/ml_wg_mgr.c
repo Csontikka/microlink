@@ -2346,16 +2346,22 @@ void ml_wg_mgr_task(void *arg) {
     }
     #undef WG_MGR_BUDGET_LEFT
 
-    /* Shutdown WireGuard interface */
+    /* Shutdown WireGuard interface. ml->wg_netif goes NULL first so the
+     * zero-copy input path and the accessors stop looking at the netif
+     * before it is torn down, not after it was freed. */
     if (ml->wg_netif) {
         struct netif *netif = (struct netif *)ml->wg_netif;
+        ml->wg_netif = NULL;
         wireguardif_shutdown(netif);
         netif_set_link_down(netif);
         netif_set_down(netif);
         vTaskDelay(pdMS_TO_TICKS(100));
         netif_remove(netif);
+        /* The struct wireguard_device behind netif->state (every peer's
+         * keypairs; ~14.7 KB on the S3 build) was never released: only the
+         * netif around it was, so each stop/start cycle leaked it. */
+        wireguardif_free(netif);
         free(netif);
-        ml->wg_netif = NULL;
     }
 
     ESP_LOGI(TAG, "WG Manager task exiting");

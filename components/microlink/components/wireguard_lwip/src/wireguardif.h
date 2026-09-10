@@ -172,6 +172,14 @@ bool wireguardif_is_wireguard_packet(const uint8_t *data, size_t len);
 // MUST be called before netif_remove/mem_free to prevent use-after-free in wireguardif_tmr
 void wireguardif_shutdown(struct netif *netif);
 
+// Release the WireGuard device behind the netif (the struct wireguard_device
+// wireguardif_init allocated: every peer's keypairs and handshake state).
+// Cancels the timer, removes the internal UDP PCB if the device owns one,
+// zeroes the key material and frees the struct; netif->state becomes NULL.
+// Call after the netif is down and removed, before freeing the netif itself.
+// Safe to call twice.
+void wireguardif_free(struct netif *netif);
+
 // Run WireGuard periodic processing (handshakes, keepalives, rekeys) from caller's task.
 // In magicsock mode, the internal sys_timeout timer is disabled to avoid running heavy
 // crypto (X25519, ChaCha20-Poly1305) on the lwIP TCPIP thread. Call this every ~400ms.
