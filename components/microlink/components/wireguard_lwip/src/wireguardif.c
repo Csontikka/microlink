@@ -125,6 +125,22 @@ static int mask_prefix_len(uint32_t mask_hbo) {
 	return n;
 }
 
+bool wireguardif_has_host_route(struct netif *netif, const ip4_addr_t *ip) {
+	if (!netif || !netif->state || !ip) return false;
+	struct wireguard_device *device = (struct wireguard_device *)netif->state;
+	for (int x = 0; x < WIREGUARD_MAX_PEERS; x++) {
+		struct wireguard_peer *peer = &device->peers[x];
+		if (!peer->valid) continue;
+		for (int y = 0; y < WIREGUARD_MAX_SRC_IPS; y++) {
+			struct wireguard_allowed_ip *aip = &peer->allowed_source_ips[y];
+			if (!aip->valid || !IP_IS_V4(&aip->ip)) continue;
+			if (ip4_addr_get_u32(ip_2_ip4(&aip->mask)) != IPADDR_BROADCAST) continue;
+			if (ip4_addr_get_u32(ip_2_ip4(&aip->ip)) == ip4_addr_get_u32(ip)) return true;
+		}
+	}
+	return false;
+}
+
 static struct wireguard_peer *peer_lookup_by_allowed_ip(struct wireguard_device *device, const ip_addr_t *ipaddr) {
 	/* Longest-prefix match across every peer's allowed_source_ips.
 	 *

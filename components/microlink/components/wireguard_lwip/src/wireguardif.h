@@ -143,6 +143,11 @@ err_t wireguardif_disconnect(struct netif *netif, u8_t peer_index);
 // Is the given peer "up"? A peer is up if it has a valid session key it can communicate with
 err_t wireguardif_peer_is_up(struct netif *netif, u8_t peer_index, ip_addr_t *current_ip, u16_t *current_port);
 
+// Does any peer own this address as a host route (an allowed IP with a /32 mask)? Tailnet peers are
+// programmed exactly like that, so this answers "is this address a tailnet node" without being fooled
+// by an exit-node peer's 0.0.0.0/0. Read-only; call it from the TCP/IP thread.
+bool wireguardif_has_host_route(struct netif *netif, const ip4_addr_t *ip);
+
 // Register a DERP relay output callback for peers without direct endpoints
 // This callback is invoked when a WireGuard packet needs to be sent to a peer
 // that has no direct IP endpoint (ip is 0.0.0.0 or port is 0)

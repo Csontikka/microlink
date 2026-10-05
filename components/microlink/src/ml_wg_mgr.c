@@ -222,6 +222,13 @@ static void pin_wg_output_cb(void *ctx)
     udp_bind_netif(s_wg_output_pcb, (const struct netif *)ctx);
 }
 
+bool microlink_wg_has_peer_ip(struct netif *wg_netif, uint32_t ip_nbo)
+{
+    ip4_addr_t ip;
+    ip4_addr_set_u32(&ip, ip_nbo);
+    return wireguardif_has_host_route(wg_netif, &ip);
+}
+
 esp_err_t microlink_pin_wg_output_netif(microlink_t *ml, struct netif *upstream)
 {
     /* Remember the upstream (STA) netif so the coord + DERP tasks can pin
