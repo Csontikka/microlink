@@ -1213,7 +1213,9 @@ void ml_derp_disconnect(microlink_t *ml) {
 
     /* Drain TX queue */
     ml_derp_tx_item_t item;
-    while (xQueueReceive(ml->derp_tx_queue, &item, 0) == pdTRUE) {
+    /* The queue may not exist: microlink_init() calls microlink_destroy()
+     * when a queue allocation fails, and xQueueReceive(NULL) asserts. */
+    while (ml->derp_tx_queue && xQueueReceive(ml->derp_tx_queue, &item, 0) == pdTRUE) {
         free(item.data);
     }
 
