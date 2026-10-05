@@ -1296,6 +1296,23 @@ static cJSON *build_hostinfo(microlink_t *ml) {
         cJSON_AddItemToObject(hostinfo, "RoutableIPs",
                               build_routable_ips_array(ml->advertise_routes));
     }
+    if (ml->config.peer_api_port) {
+        cJSON *services = cJSON_AddArrayToObject(hostinfo, "Services");
+        cJSON *http = cJSON_CreateObject();
+        cJSON *dns = cJSON_CreateObject();
+        if (!services || !http || !dns) {
+            cJSON_Delete(http);
+            cJSON_Delete(dns);
+            cJSON_Delete(hostinfo);
+            return NULL;
+        }
+        cJSON_AddStringToObject(http, "Proto", "peerapi4");
+        cJSON_AddNumberToObject(http, "Port", ml->config.peer_api_port);
+        cJSON_AddItemToArray(services, http);
+        cJSON_AddStringToObject(dns, "Proto", "peerapi-dns-proxy");
+        cJSON_AddNumberToObject(dns, "Port", 1);
+        cJSON_AddItemToArray(services, dns);
+    }
     cJSON *netinfo = cJSON_CreateObject();
     if (netinfo) {
         cJSON_AddNumberToObject(netinfo, "PreferredDERP", ml->derp_region_default);
