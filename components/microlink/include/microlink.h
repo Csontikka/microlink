@@ -70,6 +70,9 @@ typedef struct {
      * NULL/empty = no routes advertised. Internally clipped to 255 chars. */
     const char *advertise_routes;
 
+    /* Application-provided PeerAPI DNS HTTP listener; 0 = not provided. */
+    uint16_t peer_api_port;
+
     /* Netcheck override policy.
      *   netcheck_override_enabled = false → always trust the configured
      *     default region, even when netcheck measured a faster one.
