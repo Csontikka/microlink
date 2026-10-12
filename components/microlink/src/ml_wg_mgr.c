@@ -267,7 +267,7 @@ static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
 
     /* Log WG packets sent via direct UDP */
     uint32_t ip_host = ntohl(dest_ip);
-    ESP_LOGI(TAG, "WG UDP TX: %d bytes -> %d.%d.%d.%d:%d type=%d",
+    ESP_LOGD(TAG, "WG UDP TX: %d bytes -> %d.%d.%d.%d:%d type=%d",
              (int)len,
              (int)((ip_host >> 24) & 0xFF), (int)((ip_host >> 16) & 0xFF),
              (int)((ip_host >> 8) & 0xFF), (int)(ip_host & 0xFF),
@@ -1579,7 +1579,7 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
  * ========================================================================== */
 
 static void process_wg_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
-    ESP_LOGI(TAG, "WG RX: %d bytes, via_derp=%d, type=%d, from=%02x%02x%02x%02x",
+    ESP_LOGD(TAG, "WG RX: %d bytes, via_derp=%d, type=%d, from=%02x%02x%02x%02x",
              (int)pkt->len, pkt->via_derp,
              pkt->len >= 4 ? pkt->data[0] : -1,
              pkt->src_pubkey[0], pkt->src_pubkey[1], pkt->src_pubkey[2], pkt->src_pubkey[3]);
@@ -2054,9 +2054,17 @@ static void disco_periodic_probes(microlink_t *ml) {
  * 2-minute throughput collapse against rekey events, keypair destruction,
  * endpoint drift, and probe leakage.
  *
- * Output format is a single ESP_LOGW line per peer (greppable with [WG_SNAP])
+ * Output format is a single ESP_LOGI line per peer (greppable with [WG_SNAP])
  * and one summary line ([WG_SNAP_SUM]). Keep field order stable across
  * commits — the operator analyses logs by column position.
+ *
+ * INFO, not WARN (2026-10-12): the lines go out through the console sink
+ * synchronously, and on a 115200-baud UART the ~3.5 KB that 14 peers
+ * produce holds THIS task for ~300 ms every 10 s. wg_rx_queue (32 deep)
+ * overflows during that pause under a download, so a WARN-level snapshot
+ * cost every operator a burst of drops every 10 s. At INFO the snapshot
+ * is still available on demand: set the SD recorder (or the console) to
+ * INFO and it is written as before.
  * ========================================================================== */
 static void dump_wg_state_snapshot(microlink_t *ml) {
     if (!ml || !ml->wg_netif) return;
@@ -2103,7 +2111,7 @@ static void dump_wg_state_snapshot(microlink_t *ml) {
         uint32_t ep_ip_u32 = ip_addr_isany(&wp->ip) ? 0 : ip4_addr_get_u32(ip_2_ip4(&wp->ip));
         uint64_t last_pong_age = p->last_pong_recv_ms ? (now_ms - p->last_pong_recv_ms) : 0;
 
-        ESP_LOGW(TAG,
+        ESP_LOGI(TAG,
             "[WG_SNAP] %s wgi=%d ep=%u.%u.%u.%u:%u "
             "curr=%c(age=%lums cnt=%lu) prev=%c(age=%lums) "
             "lastrx=%lums lasttx=%lums lastinit=%lums "
@@ -2123,7 +2131,7 @@ static void dump_wg_state_snapshot(microlink_t *ml) {
             (unsigned long long)last_pong_age);
     }
 
-    ESP_LOGW(TAG,
+    ESP_LOGI(TAG,
         "[WG_SNAP_SUM] peers=%d linkup=%d active_probes=%d oldest_probe_age=%llums "
         "heap_internal_free=%u",
         ml->peer_count, linkup_peers, active_probes,
