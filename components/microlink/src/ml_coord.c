@@ -613,7 +613,16 @@ static int coord_recv(microlink_t *ml, uint8_t *buf, size_t len) {
     int retries = 0;
     while (recvd < len) {
         int n = ml_conn_read(ml, buf + recvd, len - recvd);
-        if (n <= 0) {
+        if (n == 0) {
+            /* Orderly close by the server. recv() leaves errno alone here, so a
+             * stale EAGAIN from an earlier timeout would read as "no data yet"
+             * and the long-poll would keep polling a dead socket until the
+             * 120 s watchdog. */
+            ESP_LOGW(TAG, "coord_recv: connection closed by the server (recvd %d/%d)", (int)recvd, (int)len);
+            errno = ENOTCONN;
+            return -1;
+        }
+        if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 if (recvd == 0) {
                     /* No data consumed yet — timeout is fine, caller can retry */
@@ -3227,6 +3236,12 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
                 data_stream_id = f_stream;
                 /* Append EVERY stream-5 DATA frame - see lp_acc_append(). */
                 lp_acc_append(ml, frame_buf + pos, f_len);
+                if (f_flags & 0x01) {
+                    /* END_STREAM: the server finished the map session. Nothing
+                     * more will ever arrive on this stream; open a new one. */
+                    ESP_LOGW(TAG, "H2 END_STREAM on the long-poll - the server closed the map session, reconnecting");
+                    proto_err = true;
+                }
             } else if (f_len > 0) {
                 /* Endpoint update response (stream 7+) — discard body */
                 ESP_LOGD(TAG, "H2 stream %lu DATA: %lu bytes (discarded)",
@@ -3241,6 +3256,25 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
             memcpy(pong + 9, frame_buf + pos, 8);
             noise_send(ml, noise, pong, sizeof(pong));
             ESP_LOGI(TAG, "Sent HTTP/2 PONG in response to server PING");
+        } else if (f_type == 0x07) {
+            /* GOAWAY: the server is shutting this connection down (deploys and
+             * idle timeouts do this). Until 2026-10-13 it was skipped like any
+             * unknown frame and the dead session was noticed only by the
+             * 120 s watchdog; the admin console showed the node offline for
+             * up to two minutes each time. */
+            uint32_t last_sid = f_len >= 4 ? (((uint32_t)(frame_buf[pos] & 0x7F) << 24) | ((uint32_t)frame_buf[pos + 1] << 16) |
+                                              ((uint32_t)frame_buf[pos + 2] << 8) | frame_buf[pos + 3]) : 0;
+            uint32_t err_code = f_len >= 8 ? (((uint32_t)frame_buf[pos + 4] << 24) | ((uint32_t)frame_buf[pos + 5] << 16) |
+                                              ((uint32_t)frame_buf[pos + 6] << 8) | frame_buf[pos + 7]) : 0;
+            ESP_LOGW(TAG, "H2 GOAWAY from the control server (last stream %lu, error %lu) - reconnecting",
+                     (unsigned long)last_sid, (unsigned long)err_code);
+            proto_err = true;
+        } else if (f_type == 0x03 && f_stream == 5) {
+            /* RST_STREAM on the long-poll: the map session is gone. */
+            uint32_t err_code = f_len >= 4 ? (((uint32_t)frame_buf[pos] << 24) | ((uint32_t)frame_buf[pos + 1] << 16) |
+                                              ((uint32_t)frame_buf[pos + 2] << 8) | frame_buf[pos + 3]) : 0;
+            ESP_LOGW(TAG, "H2 RST_STREAM on the long-poll (error %lu) - reconnecting", (unsigned long)err_code);
+            proto_err = true;
         } else if (f_type == 0x04 && !(f_flags & 0x01)) {
             /* HTTP/2 SETTINGS from server — respond with SETTINGS ACK */
             uint8_t settings_ack[9] = {0x00, 0x00, 0x00, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00};
