@@ -966,7 +966,9 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
     int body_buf_len = 0;
 
     if (body_len > 0) {
-        body_buf = ml_psram_malloc(body_len);
+        /* The header read below writes up to 3 bytes into this buffer, and the
+         * payload read grows it; never allocate less than it may receive. */
+        body_buf = ml_psram_malloc(body_len < 512 ? 512 : body_len);
         if (body_buf) {
             memcpy(body_buf, body_start, body_len);
             body_buf_len = body_len;
@@ -998,6 +1000,14 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
 
     if (msg_type != 0x02) {
         ESP_LOGE(TAG, "Unexpected Noise msg type: 0x%02x (expected 0x02)", msg_type);
+        free(body_buf);
+        return -1;
+    }
+
+    /* Noise IK msg2 is exactly the 32-byte ephemeral key plus the 16-byte
+     * tag; anything else is not a coordinator we understand. */
+    if (payload_len != 48) {
+        ESP_LOGE(TAG, "Unexpected Noise msg2 length: %d (expected 48)", payload_len);
         free(body_buf);
         return -1;
     }
