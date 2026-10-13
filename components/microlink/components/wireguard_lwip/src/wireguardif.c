@@ -48,6 +48,17 @@
 #include "lwip_compat.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
+/* Transport-data packets are encrypted from two tasks: the TCP/IP thread
+ * (netif output) and the WireGuard manager task (keepalives from the
+ * receive path and from wireguardif_periodic()). The send counter is the
+ * AEAD nonce; two packets reading it before either increments it would be
+ * encrypted under the same nonce, which breaks ChaCha20-Poly1305. One mutex
+ * covers "read counter, encrypt, increment" (2026-10-13, after TimelyToga). */
+static SemaphoreHandle_t s_wg_tx_lock;
+static StaticSemaphore_t s_wg_tx_lock_buf;
 
 #include <stdio.h>
 #include <stdbool.h>
@@ -381,6 +392,8 @@ static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, con
 				hdr->type = MESSAGE_TRANSPORT_DATA;
 				hdr->receiver = keypair->remote_index;
 				// Alignment required... pbuf_alloc has probably aligned data, but want to be sure
+				if (!s_wg_tx_lock) s_wg_tx_lock = xSemaphoreCreateMutexStatic(&s_wg_tx_lock_buf);
+				xSemaphoreTake(s_wg_tx_lock, portMAX_DELAY);
 				U64TO8_LITTLE(hdr->counter, keypair->sending_counter);
 
 				// Copy the encrypted (padded) data to the output packet - chacha20poly1305_encrypt() can encrypt data in-place which avoids call to mem_malloc
@@ -396,6 +409,7 @@ static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, con
 
 				// Then encrypt
 				wireguard_encrypt_packet(dst, dst, padded_len, keypair);
+				xSemaphoreGive(s_wg_tx_lock);
 
 				WG_DEBUG("[WG_TX] Sending encrypted DATA packet: %u bytes, remote_idx=%lu\n",
 				       (unsigned)pbuf->tot_len, (unsigned long)hdr->receiver);
@@ -1451,6 +1465,7 @@ void wireguardif_periodic(struct netif *netif) {
 }
 
 err_t wireguardif_init(struct netif *netif) {
+	if (!s_wg_tx_lock) s_wg_tx_lock = xSemaphoreCreateMutexStatic(&s_wg_tx_lock_buf);
 	err_t result;
 	struct wireguardif_init_data *init_data;
 	struct wireguard_device *device;
