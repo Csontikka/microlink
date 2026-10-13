@@ -23,6 +23,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_random.h"
+#include "esp_crt_bundle.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include "mbedtls/net_sockets.h"
@@ -788,6 +789,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     const char *derp_host = ML_DERP_HOST;
     int derp_port = ML_DERP_PORT;
     bool region_in_map = false;
+    const ml_derp_node_t *derp_node = NULL;   /* the DERPMap node we dial, for its TLS settings */
 
     if (ml->derp_region_count > 0 && ml->derp_home_region > 0) {
         for (int i = 0; i < ml->derp_region_count; i++) {
@@ -798,6 +800,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
                     if (!ml->derp_regions[i].nodes[attempt].stun_only &&
                         ml->derp_regions[i].nodes[attempt].hostname[0]) {
                         derp_host = ml->derp_regions[i].nodes[attempt].hostname;
+                        derp_node = &ml->derp_regions[i].nodes[attempt];
                         if (ml->derp_regions[i].nodes[attempt].derp_port > 0) {
                             derp_port = ml->derp_regions[i].nodes[attempt].derp_port;
                         }
@@ -822,6 +825,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
                 if (!ml->derp_regions[i].nodes[j].stun_only &&
                     ml->derp_regions[i].nodes[j].hostname[0]) {
                     derp_host = ml->derp_regions[i].nodes[j].hostname;
+                    derp_node = &ml->derp_regions[i].nodes[j];
                     if (ml->derp_regions[i].nodes[j].derp_port > 0) {
                         derp_port = ml->derp_regions[i].nodes[j].derp_port;
                     }
@@ -894,7 +898,28 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
                                  MBEDTLS_SSL_IS_CLIENT,
                                  MBEDTLS_SSL_TRANSPORT_STREAM,
                                  MBEDTLS_SSL_PRESET_DEFAULT);
-    mbedtls_ssl_conf_authmode(&ml->derp.ssl_conf, MBEDTLS_SSL_VERIFY_NONE);
+    /* Verify the relay's certificate against the ESP-IDF CA bundle, the way
+     * the coordinator connection (esp_tls) already does and the way
+     * derphttp_client.go does with the system roots. Until 2026-10-13 this was
+     * VERIFY_NONE: anyone on the path could terminate the TLS session and read
+     * the DERP frames (the WireGuard payload inside stays encrypted, but the
+     * relay protocol — who talks to whom, DISCO, handshakes — was exposed).
+     * A DERPMap node may carry InsecureForTests (verification off, as in Go)
+     * or CertName (the name the certificate is checked against instead of
+     * HostName). */
+    bool verify_tls = !(derp_node && derp_node->insecure_for_tests);
+    const char *tls_name = (derp_node && derp_node->cert_name[0]) ? derp_node->cert_name : derp_host;
+    if (verify_tls) {
+        mbedtls_ssl_conf_authmode(&ml->derp.ssl_conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+        esp_err_t cb = esp_crt_bundle_attach(&ml->derp.ssl_conf);
+        if (cb != ESP_OK) {
+            ESP_LOGE(TAG, "DERP TLS: CA bundle attach failed (%s)", esp_err_to_name(cb));
+            goto fail_tls;
+        }
+    } else {
+        ESP_LOGW(TAG, "DERP TLS: certificate verification OFF for %s (DERPMap InsecureForTests)", derp_host);
+        mbedtls_ssl_conf_authmode(&ml->derp.ssl_conf, MBEDTLS_SSL_VERIFY_NONE);
+    }
     mbedtls_ssl_conf_rng(&ml->derp.ssl_conf, mbedtls_ctr_drbg_random, &ml->derp.ctr_drbg);
     mbedtls_ssl_conf_read_timeout(&ml->derp.ssl_conf, DERP_CONNECT_TIMEOUT_MS);
 
@@ -904,7 +929,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
         ESP_LOGE(TAG, "mbedtls_ssl_setup failed (out of memory?)");
         goto fail_tls;
     }
-    mbedtls_ssl_set_hostname(&ml->derp.ssl, derp_host);
+    mbedtls_ssl_set_hostname(&ml->derp.ssl, tls_name);   /* SNI + certificate name check */
     /* Store socket fd BEFORE setting bio.
      * Use custom BIO callbacks that route through ml_read_sock/ml_write_sock,
      * which transparently support both lwIP and AT socket backends.
@@ -921,7 +946,18 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
         }
         char err_buf[128];
         mbedtls_strerror(ret, err_buf, sizeof(err_buf));
-        ESP_LOGE(TAG, "TLS handshake failed: %s", err_buf);
+        /* The CA-bundle verify callback reports an untrusted chain as
+         * X509_FATAL_ERROR; a name mismatch or expiry as CERT_VERIFY_FAILED. */
+        if (ret == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED || ret == MBEDTLS_ERR_X509_FATAL_ERROR) {
+            uint32_t flags = mbedtls_ssl_get_verify_result(&ml->derp.ssl);
+            char vrfy[160] = "";
+            if (flags != 0 && flags != (uint32_t)-1) mbedtls_x509_crt_verify_info(vrfy, sizeof(vrfy), "", flags);
+            ESP_LOGE(TAG, "DERP TLS: certificate of %s rejected (expected name %s, %s)%s%s", derp_host, tls_name,
+                     ret == MBEDTLS_ERR_X509_FATAL_ERROR ? "not signed by a trusted CA" : err_buf,
+                     vrfy[0] ? ": " : "", vrfy);
+        } else {
+            ESP_LOGE(TAG, "TLS handshake failed: %s", err_buf);
+        }
         goto fail_tls;
     }
 

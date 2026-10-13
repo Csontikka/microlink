@@ -2208,6 +2208,16 @@ static bool parse_derp_map_from_response(microlink_t *ml, cJSON *map_json) {
                 cJSON *so = cJSON_GetObjectItem(node_obj, "STUNOnly");
                 if (so && cJSON_IsTrue(so)) n->stun_only = true;
 
+                /* tailcfg.DERPNode: CertName overrides the name the relay's TLS
+                 * certificate is verified against; InsecureForTests disables the
+                 * verification (derphttp_client.go, tlsClient). */
+                cJSON *cn = cJSON_GetObjectItem(node_obj, "CertName");
+                if (cn && cn->valuestring) {
+                    strncpy(n->cert_name, cn->valuestring, sizeof(n->cert_name) - 1);
+                }
+                cJSON *ift = cJSON_GetObjectItem(node_obj, "InsecureForTests");
+                if (ift && cJSON_IsTrue(ift)) n->insecure_for_tests = true;
+
                 r->node_count++;
             }
         }

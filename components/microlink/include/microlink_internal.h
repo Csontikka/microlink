@@ -409,6 +409,8 @@ typedef struct {
     uint16_t stun_port;     /* 0 = default 3478 */
     uint16_t derp_port;     /* 0 = default 443 */
     bool stun_only;         /* true if node only serves STUN, not DERP */
+    char cert_name[64];     /* DERPNode.CertName: name the TLS cert is checked against (default HostName) */
+    bool insecure_for_tests;/* DERPNode.InsecureForTests: skip TLS verification (Go does the same) */
 } ml_derp_node_t;
 
 typedef struct {
