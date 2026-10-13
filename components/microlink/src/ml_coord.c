@@ -2274,28 +2274,34 @@ static bool parse_derp_map_from_response(microlink_t *ml, cJSON *map_json) {
     if (ml->derp_region_count > 0) {
         uint16_t measured = ml_netcheck_pick_best_derp(ml);
         uint16_t cp = ml->derp_region_default;
+        /* The comparison is against the region we are on NOW (or the configured
+         * default before the first pick), not against the default every time:
+         * the netcheck runs on every netmap fetch, and two regions that both
+         * beat the default by more than the threshold used to be picked
+         * alternately from run to run, each pick a relay reconnect. */
+        uint16_t cur = ml->derp_home_region ? ml->derp_home_region : cp;
 
         if (!ml->config.netcheck_override_enabled) {
             ESP_LOGI(TAG, "Netcheck override disabled by config — using control-plane DERP %u", cp);
-        } else if (measured > 0 && measured != cp) {
+        } else if (measured > 0 && measured != cur) {
             /* Look up RTTs from ml->derp_rtt_ms (aligned with derp_regions[]). */
-            uint16_t measured_rtt = 0, cp_rtt = 0;
+            uint16_t measured_rtt = 0, cur_rtt = 0;
             for (int r = 0; r < ml->derp_region_count; r++) {
                 if (ml->derp_regions[r].region_id == measured) measured_rtt = ml->derp_rtt_ms[r];
-                if (ml->derp_regions[r].region_id == cp) cp_rtt = ml->derp_rtt_ms[r];
+                if (ml->derp_regions[r].region_id == cur) cur_rtt = ml->derp_rtt_ms[r];
             }
-            bool cp_has_rtt = (cp != 0 && cp_rtt > 0);
-            int32_t improvement = cp_has_rtt ? (int32_t)cp_rtt - (int32_t)measured_rtt : INT32_MAX;
+            bool cur_has_rtt = (cur != 0 && cur_rtt > 0);
+            int32_t improvement = cur_has_rtt ? (int32_t)cur_rtt - (int32_t)measured_rtt : INT32_MAX;
             int32_t thresh = (int32_t)ml->config.netcheck_override_threshold_ms;
             if (improvement >= thresh) {
                 ESP_LOGI(TAG, "Netcheck override: %u (%ums) -> %u (%ums), improvement %ldms >= %ldms threshold",
-                         cp, cp_rtt, measured, measured_rtt, (long)improvement, (long)thresh);
+                         cur, cur_rtt, measured, measured_rtt, (long)improvement, (long)thresh);
                 ml->derp_home_region = measured;
             } else {
-                ESP_LOGI(TAG, "Netcheck found %u (%ums) faster than CP %u (%ums) but improvement %ldms < %ldms threshold — staying on CP",
-                         measured, measured_rtt, cp, cp_rtt, (long)improvement, (long)thresh);
+                ESP_LOGI(TAG, "Netcheck found %u (%ums) faster than current %u (%ums) but improvement %ldms < %ldms threshold — staying",
+                         measured, measured_rtt, cur, cur_rtt, (long)improvement, (long)thresh);
             }
-        } else if (measured > 0 && measured == cp) {
+        } else if (measured > 0 && measured == cur) {
             ml->derp_home_region = measured;
         }
     }
