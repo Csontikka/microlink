@@ -50,8 +50,34 @@ static void disco_send_ping_to_peer(microlink_t *ml, int peer_idx, bool force);
 static void wg_netif_bring_up_cb(void *ctx)
 {
     struct netif *netif = (struct netif *)ctx;
+    /* Join lwIP's netif list here, on the TCPIP thread, which walks that
+     * list for every forwarded packet. (netif_add is bypassed because it
+     * wants an init callback; the list link is the part of it we need.) */
+    netif->next = netif_list;
+    netif_list = netif;
     netif_set_up(netif);
     netif_set_link_up(netif);
+}
+
+/* wireguardif_init creates and binds the device's UDP PCB and arms the
+ * periodic timer: PCB and timeout list are TCPIP-thread state too. */
+struct wg_init_ctx { struct netif *netif; err_t err; };
+static void wg_netif_init_cb(void *ctx)
+{
+    struct wg_init_ctx *c = (struct wg_init_ctx *)ctx;
+    c->err = wireguardif_init(c->netif);
+}
+
+/* Teardown mirror of the above: link down, down, out of the list, and the
+ * WireGuard device (its UDP PCB included, its timer disarmed) released, all
+ * on the TCPIP thread. */
+static void wg_netif_take_down_cb(void *ctx)
+{
+    struct netif *netif = (struct netif *)ctx;
+    netif_set_link_down(netif);
+    netif_set_down(netif);
+    netif_remove(netif);
+    wireguardif_free(netif);
 }
 
 /* Same TCPIP-context rule applies to udp_new() and any UDP-PCB field writes.
@@ -385,7 +411,9 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
 
     /* Initialize WireGuard netif */
     netif->state = &wg_init;
-    err_t err = wireguardif_init(netif);
+    struct wg_init_ctx init_ctx = { .netif = netif, .err = ERR_VAL };
+    tcpip_callback_with_block(wg_netif_init_cb, &init_ctx, 1);
+    err_t err = init_ctx.err;
     if (err != ERR_OK) {
         ESP_LOGE(TAG, "wireguardif_init failed: %d", err);
         free(netif);
@@ -411,11 +439,7 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
      * callback uses raw udp_sendto (not BSD sendto) to avoid deadlock. */
     netif->input = tcpip_input;
 
-    /* Add to lwIP netif list (bypass netif_add which wants init callback) */
-    netif->next = netif_list;
-    netif_list = netif;
-
-    /* Bring interface up via tcpip_thread (see wg_netif_bring_up_cb above) */
+    /* List link + bring-up on tcpip_thread (see wg_netif_bring_up_cb above) */
     tcpip_callback_with_block(wg_netif_bring_up_cb, netif, 1);
 
     /* Create raw UDP PCB for WG output (avoids BSD sendto deadlock on TCPIP
@@ -2368,15 +2392,12 @@ void ml_wg_mgr_task(void *arg) {
     if (ml->wg_netif) {
         struct netif *netif = (struct netif *)ml->wg_netif;
         ml->wg_netif = NULL;
-        wireguardif_shutdown(netif);
-        netif_set_link_down(netif);
-        netif_set_down(netif);
-        vTaskDelay(pdMS_TO_TICKS(100));
-        netif_remove(netif);
-        /* The struct wireguard_device behind netif->state (every peer's
-         * keypairs; ~14.7 KB on the S3 build) was never released: only the
-         * netif around it was, so each stop/start cycle leaked it. */
-        wireguardif_free(netif);
+        /* Down, out of the netif list and the WireGuard device freed (every
+         * peer's keypairs; ~14.7 KB on the S3 build, once leaked here) — on
+         * the TCPIP thread, the only one that may touch the list and the
+         * UDP PCB with core locking off. Blocking: nothing refers to the
+         * netif once the callback has run. */
+        tcpip_callback_with_block(wg_netif_take_down_cb, netif, 1);
         free(netif);
     }
 
