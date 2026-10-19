@@ -596,6 +596,7 @@ struct microlink_s {
     /* Most recent netcheck RTT measurements per derp_regions[] slot.
      * Same index as derp_regions; 0 = no measurement / timed out. */
     uint16_t derp_rtt_ms[ML_MAX_DERP_REGIONS];
+    bool netinfo_dirty;            /* derp_home_region changed since the last Hostinfo the control plane saw */
 
     /* ml_get_time_ms() value when state transitioned to CONNECTED. 0 means
      * not currently connected. Used for the GUI tailnet uptime row. */
