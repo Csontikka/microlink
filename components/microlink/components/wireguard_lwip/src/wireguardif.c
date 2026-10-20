@@ -31,6 +31,7 @@
  */
 
 #include "wireguardif.h"
+#include "esp_timer.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -58,6 +59,22 @@
  * encrypted under the same nonce, which breaks ChaCha20-Poly1305. One mutex
  * covers "read counter, encrypt, increment" (2026-10-13, after TimelyToga). */
 static SemaphoreHandle_t s_wg_tx_lock;
+
+/* TX cost counters: microseconds (esp_timer, core-independent; the two senders
+ * are the TCPIP thread and the WireGuard manager task, not always on one core)
+ * from the output pbuf's allocation to its release (build, encrypt, hand-over
+ * to the socket layer), and the packets counted. Read/reset: wireguardif_tx_profile(). */
+static volatile uint32_t s_wg_tx_prof_pkts;
+static volatile uint64_t s_wg_tx_prof_us;
+
+void wireguardif_tx_profile(uint32_t *pkts, uint64_t *us, bool reset) {
+	if (pkts) *pkts = __atomic_load_n(&s_wg_tx_prof_pkts, __ATOMIC_RELAXED);
+	if (us) *us = __atomic_load_n(&s_wg_tx_prof_us, __ATOMIC_RELAXED);
+	if (reset) {
+		__atomic_store_n(&s_wg_tx_prof_pkts, 0, __ATOMIC_RELAXED);
+		__atomic_store_n(&s_wg_tx_prof_us, 0, __ATOMIC_RELAXED);
+	}
+}
 static StaticSemaphore_t s_wg_tx_lock_buf;
 
 #include <stdio.h>
@@ -208,6 +225,7 @@ static err_t wireguardif_peer_output(struct netif *netif, struct pbuf *q, struct
 	 * path (type 4, ~140 pps) stays silent — no flood, negligible overhead. */
 	uint8_t wg_mt = (q && q->tot_len >= 1) ? pbuf_get_at(q, 0) : 0;
 	bool wg_ctrl = (wg_mt == 1 || wg_mt == 2 || wg_mt == 3);
+	u16_t q_len = q ? q->tot_len : 0;   /* for the logs below: the copy-free send moves q's payload/len */
 
 	const char *path = "direct-udp";
 	err_t result;
@@ -255,6 +273,16 @@ static err_t wireguardif_peer_output(struct netif *netif, struct pbuf *q, struct
 		path = "magicsock";
 		WG_DEBUG("[WG_OUT] Using magicsock callback\n");
 
+		/* Copy-free path: a contiguous pbuf (transport data built in place in a
+		 * hook-allocated pbuf, or a handshake/cookie PBUF_RAM) is sent as it is.
+		 * udp_sendto prepends its headers into the PBUF_TRANSPORT headroom and
+		 * leaves payload/len pointing at them, so q is only freed after this. */
+		if (device->udp_pbuf_output_fn && q->len == q->tot_len) {
+			uint32_t dest_ip = ip4_addr_get_u32(ip_2_ip4(&peer->ip));
+			result = device->udp_pbuf_output_fn(dest_ip, peer->port, q, device->tx_pbuf_ctx);
+			goto done;
+		}
+
 		// Linearize pbuf chain and send via callback
 		uint8_t *data = (uint8_t *)WG_OUT_ALLOC(q->tot_len);
 		if (data) {
@@ -296,7 +324,7 @@ done:
 		       peer->public_key[2], peer->public_key[3],
 		       wg_mt, path,
 		       ip_addr_isany(&peer->ip) ? "0.0.0.0" : ipaddr_ntoa(&peer->ip),
-		       peer->port, (unsigned)(q ? q->tot_len : 0),
+		       peer->port, (unsigned)q_len,
 		       device->derp_output_fn ? 1 : 0, device->force_derp_output, (int)result);
 	} else if (wg_ctrl) {
 		WG_HSLOG("[WG_OUT_OK] peer=%02x%02x%02x%02x mt=%u path=%s ep=%s:%u "
@@ -305,7 +333,7 @@ done:
 		       peer->public_key[2], peer->public_key[3],
 		       wg_mt, path,
 		       ip_addr_isany(&peer->ip) ? "0.0.0.0" : ipaddr_ntoa(&peer->ip),
-		       peer->port, (unsigned)(q ? q->tot_len : 0),
+		       peer->port, (unsigned)q_len,
 		       device->derp_output_fn ? 1 : 0, device->force_derp_output);
 	}
 	return result;
@@ -378,10 +406,19 @@ static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, con
 				unpadded_len = 0;
 			}
 			padded_len = (unpadded_len + 15) & 0xFFFFFFF0; // Round up to next 16 byte boundary
+			int64_t prof_t0 = esp_timer_get_time();
 
 			// The buffer needs to be allocated from "transport" pool to leave room for LwIP generated IP headers
 			// The IP packet consists of 16 byte header (struct message_transport_data), data padded upto 16 byte boundary + encrypted auth tag (16 bytes)
-			pbuf = pbuf_alloc(PBUF_TRANSPORT, header_len + padded_len + WIREGUARD_AUTHTAG_LEN, PBUF_RAM);
+			// With the copy-free hook the pbuf is the one that goes out on the wire (payload in SPIRAM on
+			// the ESP32 build): built and encrypted in place, no linearise + re-copy afterwards.
+			u16_t out_len = (u16_t)(header_len + padded_len + WIREGUARD_AUTHTAG_LEN);
+			struct wireguard_device *tx_dev = (struct wireguard_device *)netif->state;
+			if (tx_dev->tx_pbuf_alloc_fn && tx_dev->udp_pbuf_output_fn) {
+				pbuf = tx_dev->tx_pbuf_alloc_fn(out_len, tx_dev->tx_pbuf_ctx);
+			} else {
+				pbuf = pbuf_alloc(PBUF_TRANSPORT, out_len, PBUF_RAM);
+			}
 			if (pbuf) {
 				// Note: allocating pbuf from RAM above guarantees that the pbuf is in one section and not chained
 				// - i.e payload points to the contiguous memory region
@@ -426,6 +463,8 @@ static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, con
 				}
 
 				pbuf_free(pbuf);
+				__atomic_fetch_add(&s_wg_tx_prof_us, (uint64_t)(esp_timer_get_time() - prof_t0), __ATOMIC_RELAXED);
+				__atomic_fetch_add(&s_wg_tx_prof_pkts, 1, __ATOMIC_RELAXED);
 
 				// Check to see if we should rekey
 				if (keypair->sending_counter >= REKEY_AFTER_MESSAGES) {
@@ -1637,6 +1676,18 @@ void wireguardif_set_derp_output(struct netif *netif, wireguard_derp_output_fn f
 	if (device->valid) {
 		device->derp_output_fn = fn;
 		device->derp_output_ctx = ctx;
+	}
+}
+
+void wireguardif_set_tx_pbuf_output(struct netif *netif, wireguard_tx_pbuf_alloc_fn alloc_fn,
+                                    wireguard_udp_pbuf_output_fn output_fn, void *ctx) {
+	LWIP_ASSERT("netif != NULL", (netif != NULL));
+	LWIP_ASSERT("state != NULL", (netif->state != NULL));
+	struct wireguard_device *device = (struct wireguard_device *)netif->state;
+	if (device->valid) {
+		device->tx_pbuf_alloc_fn = (alloc_fn && output_fn) ? alloc_fn : NULL;
+		device->udp_pbuf_output_fn = (alloc_fn && output_fn) ? output_fn : NULL;
+		device->tx_pbuf_ctx = ctx;
 	}
 }
 
