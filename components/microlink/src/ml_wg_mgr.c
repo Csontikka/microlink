@@ -412,7 +412,7 @@ esp_err_t ml_wg_set_tx_copyfree(microlink_t *ml, bool on) {
     wireguardif_set_tx_pbuf_output((struct netif *)ml->wg_netif,
                                    on ? wg_tx_pbuf_alloc_cb : NULL, on ? wg_udp_pbuf_output_cb : NULL, ml);
     ml->wg_tx_copyfree = on;
-    ESP_LOGW(TAG, "WG TX copy-free path %s", on ? "ON" : "OFF (copying path)");
+    ESP_LOGI(TAG, "WG TX copy-free path %s", on ? "ON" : "OFF (copying path)");
     return ESP_OK;
 }
 
@@ -1514,7 +1514,7 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
             for (int i = 0; i < MAX_PENDING_PROBES; i++) {
                 if (pending_probes[i].active) active_count++;
             }
-            ESP_LOGW(TAG, "DISCO PONG unmatched from %s (via %s) txid=%02x%02x%02x%02x, active_probes=%d"
+            ESP_LOGI(TAG, "DISCO PONG unmatched from %s (via %s) txid=%02x%02x%02x%02x, active_probes=%d"
                           " (%lu more suppressed in the last 10s)",
                      name, pkt->via_derp ? "DERP" : "direct",
                      txid[0], txid[1], txid[2], txid[3], active_count,
@@ -1580,13 +1580,30 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
     if (!plaintext) return;
 
     if (nacl_box_open_afternm(plaintext, ciphertext, ciphertext_len, nonce, shared) != 0) {
-        /* The sender is a known peer, so a MAC failure means OUR key material
-         * for it is stale (#31); the prefix lets it be correlated externally. */
-        ESP_LOGW(TAG, "DISCO decrypt failed (from %s via %s, disco_key=%02x%02x%02x%02x...)",
-                 ml->peers[sender_idx].hostname,
-                 pkt->via_derp ? "DERP" : "direct",
-                 sender_disco_key[0], sender_disco_key[1],
-                 sender_disco_key[2], sender_disco_key[3]);
+        /* The sender is a known peer and its key is current, so the box was
+         * sealed for someone else. The usual case: two nodes behind one NAT
+         * both advertised the same public endpoint at different times and the
+         * sender still probes the stale one, so a message meant for the other
+         * node lands here. The reference client drops these silently
+         * ("wrong rcpt?"). One line a minute keeps a real key-material problem
+         * (#31) visible without a WARN per probe. (esphome-tailscale 0.5.16.) */
+        static uint64_t last_wrong_rcpt_log_ms = 0;
+        static uint32_t wrong_rcpt_suppressed = 0;
+        uint64_t now_ms = ml_get_time_ms();
+        if (last_wrong_rcpt_log_ms == 0 || now_ms - last_wrong_rcpt_log_ms > 60000) {
+            ESP_LOGW(TAG, "DISCO from %s (via %s, disco_key=%02x%02x%02x%02x...) not sealed for us - "
+                          "usually a stale endpoint shared with another node behind the same NAT; "
+                          "dropped (%lu more in the last 60 s)",
+                     ml->peers[sender_idx].hostname,
+                     pkt->via_derp ? "DERP" : "direct",
+                     sender_disco_key[0], sender_disco_key[1],
+                     sender_disco_key[2], sender_disco_key[3],
+                     (unsigned long)wrong_rcpt_suppressed);
+            last_wrong_rcpt_log_ms = now_ms;
+            wrong_rcpt_suppressed = 0;
+        } else {
+            wrong_rcpt_suppressed++;
+        }
         free(plaintext);
         return;
     }
@@ -2150,7 +2167,7 @@ static void disco_periodic_probes(microlink_t *ml) {
                 wireguardif_connect_derp(netif, (u8_t)p->wg_peer_index);
                 p->derp_fallback_active = true;
                 p->last_derp_attempt_ms = now;
-                ESP_LOGW(TAG, "DERP handshake %s -> %s (no WG session in %llus)",
+                ESP_LOGI(TAG, "DERP handshake %s -> %s (no WG session in %llus)",
                          first_attempt ? "init" : "retry",
                          p->hostname,
                          (unsigned long long)((now - p->peer_added_ms) / 1000));
@@ -2480,7 +2497,7 @@ void ml_wg_mgr_task(void *arg) {
             /* Throughput-collapse diag: only log when actually slow (>30ms),
              * routine fast ticks are noise. */
             if (dt > 30) {
-                ESP_LOGW(TAG, "wireguardif_periodic SLOW: %llu ms",
+                ESP_LOGI(TAG, "wireguardif_periodic SLOW: %llu ms",
                          (unsigned long long)dt);
             }
         }
@@ -2493,7 +2510,7 @@ void ml_wg_mgr_task(void *arg) {
             uint64_t dt = ml_get_time_ms() - t0;
             last_disco_probe_ms = now;
             if (dt > 30) {
-                ESP_LOGW(TAG, "disco_periodic_probes SLOW: %llu ms",
+                ESP_LOGI(TAG, "disco_periodic_probes SLOW: %llu ms",
                          (unsigned long long)dt);
             }
         }

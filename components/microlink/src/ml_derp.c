@@ -549,16 +549,13 @@ void ml_derp_tx_task(void *arg) {
          * the instant it blocks in a socket call. */
         ml->derp_last_heartbeat_ms = loop_start;
 
-        /* Unconditional heartbeat - proves task is alive. Was ESP_LOGW so
-         * it would survive any default-log-level filter while debugging
-         * the DERP-stall issue; now downgraded to INFO since the /log
-         * ring + /tailscale diag panel cover that need and the W-spam
-         * was drowning real warnings. */
-        /* TEMP 2026-05-27: WARN + 2s so the SD recorder captures the DERP frame
-         * rate during the exit-node throughput hunt (loop_count vs frames_tx/rx
-         * tells us if the loop spins without progress or is genuinely starved). */
-        if (loop_start - last_heartbeat_ms > 2000) {
-            ESP_LOGW(TAG, "HEARTBEAT: loop=%lu conn=%d rx=%lu tx=%lu stack_free=%lu",
+        /* Heartbeat: proves the task is alive. INFO and once a minute. It was
+         * a temporary WARN every 2 s for the 2026-05 exit-node throughput hunt
+         * and stayed that way: at the default WARN level it put a line on the
+         * console and the SD recorder every 2 s. The liveness stamp above and
+         * the diag panel cover the watchdog need. */
+        if (loop_start - last_heartbeat_ms > 60000) {
+            ESP_LOGI(TAG, "HEARTBEAT: loop=%lu conn=%d rx=%lu tx=%lu stack_free=%lu",
                      (unsigned long)loop_count, ml->derp.connected,
                      (unsigned long)s_derp_frames_rx, (unsigned long)frames_tx,
                      (unsigned long)uxTaskGetStackHighWaterMark(NULL));
@@ -568,8 +565,8 @@ void ml_derp_tx_task(void *arg) {
         /* ---- Periodic status logging (always, even when disconnected) ---- */
         {
             uint64_t now_ms = loop_start;
-            if (now_ms - last_status_ms > 10000) {
-                ESP_LOGW(TAG, "DERP status: connected=%d fd=%d rx=%lu tx=%lu loops=%lu",
+            if (now_ms - last_status_ms > 60000) {
+                ESP_LOGI(TAG, "DERP status: connected=%d fd=%d rx=%lu tx=%lu loops=%lu",
                          ml->derp.connected, ml->derp.sockfd,
                          (unsigned long)s_derp_frames_rx, (unsigned long)frames_tx,
                          (unsigned long)loop_count);
@@ -885,7 +882,18 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     int64_t t_derp_tcp = esp_timer_get_time();
     ESP_LOGI(TAG, "[TIMING] DERP TCP connect: %lld ms", (t_derp_tcp - t_derp_dns) / 1000);
 
-    /* TLS setup */
+    /* TLS setup. Free any prior state first: mbedtls_*_init() only zeroes the
+     * structs, so buffers left by a connect that got past mbedtls_ssl_setup()
+     * and then failed on a path that skipped fail_tls, or by a session torn
+     * down without ml_derp_disconnect(), would be orphaned, and the
+     * dynamic-buffer code would start the next handshake on a half-initialised
+     * context. The free functions are safe on zeroed and on already-freed
+     * structs. (esphome-tailscale 0.5.19.) */
+    mbedtls_ssl_free(&ml->derp.ssl);
+    mbedtls_ssl_config_free(&ml->derp.ssl_conf);
+    mbedtls_ctr_drbg_free(&ml->derp.ctr_drbg);
+    mbedtls_entropy_free(&ml->derp.entropy);
+
     mbedtls_ssl_init(&ml->derp.ssl);
     mbedtls_ssl_config_init(&ml->derp.ssl_conf);
     mbedtls_entropy_init(&ml->derp.entropy);
