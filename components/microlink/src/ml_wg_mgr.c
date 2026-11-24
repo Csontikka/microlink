@@ -319,6 +319,19 @@ static void pin_wg_output_cb(void *ctx)
     udp_bind_netif(s_wg_output_pcb, (const struct netif *)ctx);
 }
 
+/* Can this IPv4 address (host byte order) be probed and installed as a peer's
+ * direct endpoint? See wireguardif_endpoint_usable(): not a tailnet node, not
+ * loopback / link-local / multicast. Before the interface exists only the
+ * address-class part applies; the WireGuard layer repeats the full test when
+ * the endpoint is installed. */
+static bool disco_endpoint_usable(microlink_t *ml, uint32_t ip_hbo)
+{
+    ip_addr_t a;
+    IP_SET_TYPE_VAL(a, IPADDR_TYPE_V4);
+    ip4_addr_set_u32(ip_2_ip4(&a), htonl(ip_hbo));
+    return wireguardif_endpoint_usable((struct netif *)ml->wg_netif, &a);
+}
+
 bool microlink_wg_has_peer_ip(struct netif *wg_netif, uint32_t ip_nbo)
 {
     ip4_addr_t ip;
@@ -1358,7 +1371,12 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
             matched = true;
             break;
         }
-        if (!pkt->via_derp && pkt->src_ip != 0) {
+        if (!pkt->via_derp && pkt->src_ip != 0 && !disco_endpoint_usable(ml, pkt->src_ip)) {
+            /* The PONG came back through the tunnel (source = the peer's
+             * tailnet address) or from an address that cannot be an endpoint.
+             * It still proves the peer is alive, not that a direct path exists. */
+            ESP_LOGD(TAG, "DISCO PONG from %s arrived from a non-endpoint address, not used as a path", p->hostname);
+        } else if (!pkt->via_derp && pkt->src_ip != 0) {
             p->best_ip = pkt->src_ip;
             p->best_port = pkt->src_port;
             p->best_last_pong_ms = now;
@@ -1692,6 +1710,11 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
                               ((uint32_t)entry[13] << 16) |
                               ((uint32_t)entry[14] << 8) |
                               (uint32_t)entry[15];
+
+                /* A CallMeMaybe is sealed by the peer, but its contents are the
+                 * peer's claim: never probe a tailnet, loopback, link-local or
+                 * multicast address it offers. */
+                if (!disco_endpoint_usable(ml, ip)) continue;
 
                 if (!burst_ok) continue;
 

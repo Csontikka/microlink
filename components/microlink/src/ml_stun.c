@@ -375,7 +375,11 @@ bool ml_stun_parse_response(const uint8_t *data, size_t len,
     }
 
     /* Check txid against IPv4 txid (IPv6 responses use separate parser) */
-    if (txid_v4_valid && memcmp(data + 8, txid_v4, 12) != 0) {
+    /* Only a response to a request that is still outstanding is accepted.
+     * txid_v4_valid is cleared when a probe succeeds; until the next request
+     * any Binding Response, from anyone, used to pass and could rewrite the
+     * public endpoint we advertise. (Upstream microlink f2ade3e.) */
+    if (!txid_v4_valid || memcmp(data + 8, txid_v4, 12) != 0) {
         /* Could be an IPv6 response arriving on IPv4 queue — don't warn */
         ESP_LOGD(TAG, "STUN IPv4 txid mismatch (may be IPv6 response)");
         return false;

@@ -444,7 +444,13 @@ static int poll_derp_read(microlink_t *ml) {
     }
 
     /* For RecvPacket (0x05): first 32 bytes are sender's public key */
-    if (frame_type == DERP_FRAME_RECV_PACKET && len > 32) {
+    if (frame_type == DERP_FRAME_RECV_PACKET && len <= 32) {
+        /* Too short to carry a source key and a payload: drop it instead of
+         * routing it with an all-zero source key. (Upstream microlink f2ade3e.) */
+        free(buf);
+        return 1;
+    }
+    if (frame_type == DERP_FRAME_RECV_PACKET) {
         memcpy(src_key, buf, 32);
         payload = malloc(len - 32);
         if (payload) {
@@ -1030,7 +1036,10 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
 
         resp_buf[resp_len] = '\0';
 
-        if (!found_end || strstr((char *)resp_buf, "101") == NULL) {
+        /* The status line must be the upgrade itself; "101" anywhere in the
+         * headers (a date, a length, a cookie) is not. */
+        if (!found_end || (strncmp((char *)resp_buf, "HTTP/1.1 101", 12) != 0 &&
+                           strncmp((char *)resp_buf, "HTTP/1.0 101", 12) != 0)) {
             ESP_LOGE(TAG, "DERP upgrade rejected: %.100s", resp_buf);
             goto fail_tls;
         }

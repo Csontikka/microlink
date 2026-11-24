@@ -148,6 +148,13 @@ err_t wireguardif_peer_is_up(struct netif *netif, u8_t peer_index, ip_addr_t *cu
 // by an exit-node peer's 0.0.0.0/0. Read-only; call it from the TCP/IP thread.
 bool wireguardif_has_host_route(struct netif *netif, const ip4_addr_t *ip);
 
+// Can this address be a peer's outer (underlay) address? False for unspecified, loopback, link-local,
+// multicast and broadcast addresses and for any tailnet node (our own tunnel address, a peer's host
+// route): an endpoint inside the tunnel sends every encrypted packet back into the tunnel.
+// wireguardif_update_endpoint() and the receive path apply it; callers use it to drop such a
+// candidate before probing it. Read-only.
+bool wireguardif_endpoint_usable(struct netif *netif, const ip_addr_t *addr);
+
 // Register a DERP relay output callback for peers without direct endpoints
 // This callback is invoked when a WireGuard packet needs to be sent to a peer
 // that has no direct IP endpoint (ip is 0.0.0.0 or port is 0)

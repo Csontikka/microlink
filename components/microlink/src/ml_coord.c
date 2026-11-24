@@ -2835,8 +2835,15 @@ static int do_map_exchange(microlink_t *ml, ml_noise_state_t *noise, bool send_r
             cJSON *key_expiry = cJSON_GetObjectItem(node, "KeyExpiry");
             if (key_expiry && key_expiry->valuestring) {
                 int yr, mo, dy, hr, mn, sc;
+                /* Range-checked: the epoch arithmetic below loops over the years
+                 * and indexes a month table with these values. A key that does
+                 * not expire is sent as year 1, which is out of range and
+                 * leaves 0 = no expiry (it used to come out negative). */
+                ml->key_expiry_epoch = 0;
                 if (sscanf(key_expiry->valuestring, "%d-%d-%dT%d:%d:%d",
-                           &yr, &mo, &dy, &hr, &mn, &sc) >= 6) {
+                           &yr, &mo, &dy, &hr, &mn, &sc) >= 6 &&
+                    yr >= 1970 && yr <= 2200 && mo >= 1 && mo <= 12 && dy >= 1 && dy <= 31 &&
+                    hr >= 0 && hr <= 23 && mn >= 0 && mn <= 59 && sc >= 0 && sc <= 60) {
                     /* Simple epoch calculation (approximate, no leap second) */
                     /* Days from year 1970 */
                     int64_t days = 0;

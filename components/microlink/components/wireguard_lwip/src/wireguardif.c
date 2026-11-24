@@ -170,12 +170,25 @@ bool wireguardif_is_wireguard_packet(const uint8_t *data, size_t len) {
 // Only ever called for a packet that has just authenticated (initiation,
 // response, cookie reply, transport data), so it is also where a working direct
 // path is proven: stamp last_rx_direct here, never for DERP-relayed packets.
-static void update_peer_addr(struct wireguard_peer *peer, const ip_addr_t *addr, u16_t port) {
+static void update_peer_addr(struct wireguard_device *device, struct wireguard_peer *peer, const ip_addr_t *addr, u16_t port) {
 	// Don't overwrite a valid endpoint with 0.0.0.0 (DERP-injected packets have no real source)
 	// This bug was causing DERP routing to break after receiving the first packet
 	if (ip_addr_isany(addr)) {
 		WG_DEBUG("[WG] update_peer_addr: skipping DERP (0.0.0.0)\n");
 		return;  // Skip updating endpoint for DERP packets
+	}
+	// A peer can reach our WireGuard port through the tunnel itself (the socket
+	// is bound to 0.0.0.0), and the packet then arrives from its tailnet
+	// address. That is not a path: see wireguardif_endpoint_usable().
+	if (!wireguardif_endpoint_usable(device->netif, addr)) {
+		static uint32_t last_refused_log;
+		uint32_t now = wireguard_sys_now();
+		if (last_refused_log == 0 || now - last_refused_log > 60000) {
+			ESP_LOGW(TAG, "[WG] packet from %s:%u authenticated, but that address cannot be an endpoint; keeping the current one",
+			         ipaddr_ntoa(addr), port);
+			last_refused_log = now ? now : 1;
+		}
+		return;
 	}
 	WG_DEBUG("[WG] update_peer_addr: %s:%u\n", ipaddr_ntoa(addr), port);
 	peer->ip = *addr;
@@ -204,6 +217,52 @@ bool wireguardif_has_host_route(struct netif *netif, const ip4_addr_t *ip) {
 			if (ip4_addr_get_u32(ip_2_ip4(&aip->ip)) == ip4_addr_get_u32(ip)) return true;
 		}
 	}
+	return false;
+}
+
+// Can `addr` be the outer (underlay) address of a peer?
+//
+// Refused: unspecified, 0.0.0.0/8, loopback, link-local, multicast, reserved
+// and broadcast addresses, and any address that is a tailnet node: our own
+// tunnel address or a peer's host route. With such an endpoint the encrypted
+// packet is routed back into this interface, encrypted for the same peer and
+// sent to the same address again, until the stack overflows; any tailnet peer
+// can cause it by sending a valid WireGuard packet to our tunnel address, or by
+// offering its tailnet address in a CallMeMaybe.
+//
+// 100.64.0.0/10 as a whole is NOT refused, unlike upstream microlink
+// (2e567c6): an uplink can live in that range (Starlink, LTE/5G routers,
+// carrier NAT), and a peer on the same LAN is then legitimately reached at a
+// 100.64.x.x address that is not a tailnet node. The host-route test is exact.
+// The outer path is IPv4-only, so an IPv6 address is refused when it could
+// only be reached through the tunnel or hides an IPv4 address.
+bool wireguardif_endpoint_usable(struct netif *netif, const ip_addr_t *addr) {
+	if (!addr) return false;
+#if LWIP_IPV4
+	if (IP_IS_V4(addr)) {
+		const uint32_t a = PP_NTOHL(ip4_addr_get_u32(ip_2_ip4(addr)));
+		if ((a >> 24) == 0 || (a >> 24) == 127) return false;          // 0.0.0.0/8, loopback
+		if ((a & 0xFFFF0000u) == 0xA9FE0000u) return false;            // 169.254.0.0/16 link-local
+		if ((a >> 28) >= 0xE) return false;                            // multicast, reserved, broadcast
+		if (netif) {
+			if (ip4_addr_get_u32(netif_ip4_addr(netif)) == ip4_addr_get_u32(ip_2_ip4(addr))) return false;
+			if (wireguardif_has_host_route(netif, ip_2_ip4(addr))) return false;
+		}
+		return true;
+	}
+#endif
+#if LWIP_IPV6
+	if (IP_IS_V6(addr)) {
+		const uint32_t w0 = PP_NTOHL(ip_2_ip6(addr)->addr[0]);
+		const uint32_t w1 = PP_NTOHL(ip_2_ip6(addr)->addr[1]);
+		const uint32_t w2 = PP_NTOHL(ip_2_ip6(addr)->addr[2]);
+		if (w0 == 0xfd7a115cu && (w1 >> 16) == 0xa1e0u) return false;  // fd7a:115c:a1e0::/48 tailnet
+		if ((w0 >> 24) == 0xff) return false;                          // multicast
+		if ((w0 & 0xffc00000u) == 0xfe800000u) return false;           // fe80::/10 link-local
+		if (w0 == 0 && w1 == 0 && (w2 == 0 || w2 == 0x0000ffffu)) return false;  // ::/96, IPv4-mapped
+		return true;
+	}
+#endif
 	return false;
 }
 
@@ -611,7 +670,7 @@ static void wireguardif_process_response_message(struct wireguard_device *device
 		       peer->public_key[2], peer->public_key[3],
 		       ip_addr_isany(addr) ? "DERP" : ipaddr_ntoa(addr), port);
 		// Update the peer location
-		update_peer_addr(peer, addr, port);
+		update_peer_addr(device, peer, addr, port);
 
 		peer->handshake_attempts = 0;  // session up, reset retry counter
 		peer->last_data_tx = 0;        // heard from the peer
@@ -695,7 +754,7 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 
 					// 3. Since the packet has authenticated correctly, the source IP of the outer UDP/IP packet is used to update the endpoint for peer TrMv...WXX0.
 					// Update the peer location
-					update_peer_addr(peer, addr, port);
+					update_peer_addr(device, peer, addr, port);
 
 					now = wireguard_sys_now();
 					keypair->last_rx = now;
@@ -1019,7 +1078,7 @@ void wireguardif_network_rx(void *arg, struct udp_pcb *pcb, struct pbuf *p, cons
 				if (peer) {
 					ESP_LOGI(TAG, "[WG_RX] Initiation processed OK, sending response");
 					// Update the peer location
-					update_peer_addr(peer, addr, port);
+					update_peer_addr(device, peer, addr, port);
 
 					// If initiation arrived via DERP (addr=0.0.0.0), send response
 					// via DERP too by temporarily clearing the peer endpoint.
@@ -1078,8 +1137,10 @@ void wireguardif_network_rx(void *arg, struct udp_pcb *pcb, struct pbuf *p, cons
 			peer = peer_lookup_by_handshake(device, msg_cookie->receiver);
 			if (peer) {
 				if (wireguard_process_cookie_message(device, peer, msg_cookie)) {
-					// Update the peer location
-					update_peer_addr(peer, addr, port);
+					// The endpoint is not updated here. A cookie reply proves no
+					// session, and wireguard-go only moves the endpoint on an
+					// authenticated initiation, response or transport packet
+					// (SetEndpointFromPacket in device/receive.go).
 
 					// Don't send anything out - we stay quiet until the next initiation message
 				}
@@ -1259,6 +1320,10 @@ void wireguardif_free(struct netif *netif) {
 err_t wireguardif_update_endpoint(struct netif *netif, u8_t peer_index, const ip_addr_t *ip, u16_t port) {
 	struct wireguard_peer *peer;
 	err_t result = wireguardif_lookup_peer(netif, peer_index, &peer);
+	// 0.0.0.0 stays allowed: it is how a caller clears the endpoint (relay only).
+	if (result == ERR_OK && !ip_addr_isany(ip) && !wireguardif_endpoint_usable(netif, ip)) {
+		result = ERR_ARG;
+	}
 	if (result == ERR_OK) {
 		peer->connect_ip = *ip;
 		peer->connect_port = port;
