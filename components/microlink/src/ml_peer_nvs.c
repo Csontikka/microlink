@@ -139,7 +139,22 @@ void ml_peer_nvs_deinit(void) {
 esp_err_t ml_peer_nvs_save(const ml_peer_t *peer) {
     if (!s_initialized || !peer || !s_table) return ESP_ERR_INVALID_STATE;
 
-    /* Advance LRU clock */
+    /* Advance the LRU clock. It is 16 bits: before it wraps, renumber the
+     * entries by rank so that the order survives and the clock restarts
+     * just above them. */
+    if (s_table->lru_clock == UINT16_MAX) {
+        uint16_t rank[ML_NVS_MAX_PEERS];
+        for (int i = 0; i < s_table->count; i++) {
+            uint16_t r = 1;
+            for (int j = 0; j < s_table->count; j++) {
+                if (s_table->entries[j].lru_counter < s_table->entries[i].lru_counter ||
+                    (s_table->entries[j].lru_counter == s_table->entries[i].lru_counter && j < i)) r++;
+            }
+            rank[i] = r;
+        }
+        for (int i = 0; i < s_table->count; i++) s_table->entries[i].lru_counter = rank[i];
+        s_table->lru_clock = s_table->count;
+    }
     s_table->lru_clock++;
 
     /* Build entry */
@@ -187,8 +202,15 @@ esp_err_t ml_peer_nvs_save(const ml_peer_t *peer) {
     }
 
     if (slot >= 0) {
-        /* Update existing entry */
+        /* Update existing entry. This runs for every peer of every netmap:
+         * when nothing that is stored changed, only the LRU stamp moves, in
+         * RAM, and the flash is left alone (it used to be a blob rewrite per
+         * peer per netmap). The stamp reaches the flash with the next real
+         * change. */
+        peer_nvs_entry_t prev = s_table->entries[slot];
+        prev.lru_counter = entry.lru_counter;
         s_table->entries[slot] = entry;
+        if (memcmp(&prev, &entry, sizeof(entry)) == 0) return ESP_OK;
     } else if (s_table->count < ML_NVS_MAX_PEERS) {
         /* Append new entry */
         slot = s_table->count;

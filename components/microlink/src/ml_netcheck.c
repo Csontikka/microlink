@@ -26,9 +26,16 @@
 
 static const char *TAG = "ml_netcheck";
 
-#define NETCHECK_TIMEOUT_MS    25000 /* Total budget — covers a 19-second STUN retry seen in ml_stun */
-#define NETCHECK_RETRY_GAP_MS  5000  /* Re-send to non-responded regions every 5 s, mimics tailscale Go */
-#define NETCHECK_MAX_RETRIES   3     /* Initial send + up to 3 retries = 4 attempts/region */
+#define NETCHECK_TIMEOUT_MS    10000 /* Total budget when nothing answers: the first send plus one
+                                      * retry sweep. The sweep runs on the coord task and holds the
+                                      * map stream, so an uplink that drops UDP 3478 (or a relay whose
+                                      * STUN port is not reachable) used to cost 25 s on every connect;
+                                      * the reference client caps its whole report at about 5 s. */
+#define NETCHECK_RETRY_GAP_MS  5000  /* Re-send to non-responded regions after 5 s, mimics tailscale Go */
+#define NETCHECK_MAX_RETRIES   1     /* Initial send + 1 retry = 2 attempts/region */
+#define NETCHECK_PROBE_WAIT_MS 2000  /* A probe out for this long is no longer waited for (its answer still counts
+                                      * if it arrives): one region that never answers used to hold the second
+                                      * round back for the whole retry gap and then the exit until the deadline */
 #define NETCHECK_PROBE_GAP_MS  50    /* Spread sendto() to avoid local NAT/UDP burst loss */
 #define NETCHECK_MAX_PROBES    ML_MAX_DERP_REGIONS
 #define NETCHECK_SAMPLES       2     /* probes per region; the lower RTT counts (WiFi modem-sleep adds 0-100 ms of jitter to a single sample) */
@@ -305,18 +312,17 @@ uint16_t ml_netcheck_pick_best_derp(microlink_t *ml) {
         /* Done early when every region has its samples, or when the retry
          * budget is spent and nothing is in flight any more. */
         bool all_sampled = probe_count > 0, any_in_flight = false;
+        uint64_t t_eval = esp_timer_get_time();
         for (int i = 0; i < probe_count; i++) {
             if (probes[i].samples < NETCHECK_SAMPLES) all_sampled = false;
-            if (probes[i].in_flight) any_in_flight = true;
+            if (probes[i].in_flight && t_eval - probes[i].send_us < (uint64_t)NETCHECK_PROBE_WAIT_MS * 1000ULL) any_in_flight = true;
         }
         if (all_sampled) break;
         if (retries_done >= NETCHECK_MAX_RETRIES && !any_in_flight) break;
-        /* A region with one answer is not waited for across a 5 s retry gap:
-         * once everything has answered at least once, the second sample
-         * round follows at once. */
-        bool all_answered = true;
-        for (int i = 0; i < probe_count && all_answered; i++) all_answered = probes[i].got_response;
-        if (all_answered && !any_in_flight && retries_done < NETCHECK_MAX_RETRIES) next_retry_at = esp_timer_get_time();
+        /* The next round is not held back for the 5 s retry gap: once every
+         * probe has been answered or has been out for NETCHECK_PROBE_WAIT_MS,
+         * it follows at once. */
+        if (!any_in_flight && retries_done < NETCHECK_MAX_RETRIES) next_retry_at = t_eval;
     }
     close(sock);
     if (netcheck_stop_requested(ml)) {

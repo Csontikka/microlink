@@ -454,6 +454,13 @@ typedef struct {
     bool connected;
     volatile bool rx_parked;        /* reader sets true when NOT touching the ssl context */
     uint64_t last_recv_ms;          /* For keepalive watchdog */
+    /* TLS session saved from the last successful connect, so that the next
+     * connect to the same relay node can resume it (session ticket) instead
+     * of a full handshake. Survives the per-connect free/init of the
+     * contexts above; freed in ml_derp_free_saved_session(). */
+    mbedtls_ssl_session saved_session;
+    bool have_saved_session;
+    char saved_session_name[64];    /* TLS name the session was verified for */
 } ml_derp_conn_t;
 
 /* ============================================================================
@@ -598,6 +605,13 @@ struct microlink_s {
     uint16_t derp_rtt_ms[ML_MAX_DERP_REGIONS];
     bool netinfo_dirty;            /* derp_home_region changed since the last Hostinfo the control plane saw */
     bool wg_tx_copyfree;           /* WireGuard TX: encrypt in place in the outgoing SPIRAM pbuf (true) or copy (false) */
+    /* The DERPMap the last netcheck measured (fingerprint of region ids,
+     * node hostnames and STUN ports), when it ran and what it picked: a
+     * DERPMap arriving again unchanged on the stream reuses the result
+     * instead of blocking the coord task for another sweep. */
+    uint32_t netcheck_map_fp;
+    uint64_t netcheck_done_ms;
+    uint16_t netcheck_best;
 
     /* ml_get_time_ms() value when state transitioned to CONNECTED. 0 means
      * not currently connected. Used for the GUI tailnet uptime row. */
@@ -719,6 +733,7 @@ void ml_derp_rx_task(void *arg);
 esp_err_t ml_derp_connect(microlink_t *ml);
 esp_err_t ml_wg_set_tx_copyfree(microlink_t *ml, bool on);
 void ml_derp_disconnect(microlink_t *ml);
+void ml_derp_free_saved_session(microlink_t *ml);
 
 /* Every microlink task calls this as its LAST statement before
  * vTaskDelete(NULL): after it returns the task must not touch ml again,
